@@ -1371,3 +1371,193 @@ class TestGetProviderOpenAI:
             get_provider("openai")
         captured = capsys.readouterr()
         assert "cloud" in captured.err.lower()
+
+
+class _FixedQueryProvider:
+    """Provider returning a preset query vector; never called for indexing."""
+
+    name = "test:parity"
+
+    def __init__(self, query_vec):
+        self._query_vec = query_vec
+        self.dimension = len(query_vec)
+
+    def embed(self, texts):  # pragma: no cover - indexing not exercised here
+        raise AssertionError("search must not embed documents")
+
+    def embed_query(self, text):
+        return list(self._query_vec)
+
+
+class TestSearchBackendParity:
+    """The NumPy scan must rank identically to the pure-Python one.
+
+    ``search`` is the hot path: it decodes and dots every stored vector on each
+    query. Vectorising it is only safe if the two implementations agree on the
+    awkward cases as well as the ordinary one, so each case is asserted against
+    both backends rather than against hand-written expectations.
+    """
+
+    QUERY = [1.0, 0.0, 0.0]
+
+    def _store_with_vectors(self, tmp_path, rows, query_vec=None):
+        db = tmp_path / "parity.db"
+        provider = _FixedQueryProvider(query_vec or self.QUERY)
+        with patch(
+            "code_review_graph.embeddings.get_provider", return_value=provider
+        ):
+            store = EmbeddingStore(db)
+        for name, vector in rows:
+            store._conn.execute(
+                "INSERT INTO embeddings (qualified_name, vector, text_hash, provider) "
+                "VALUES (?, ?, ?, ?)",
+                (name, _encode_vector(vector), "hash", provider.name),
+            )
+        store._conn.commit()
+        return store
+
+    def _both_backends(self, store, limit=20):
+        """Return (numpy_results, python_results) for the same store."""
+        numpy_results = store.search("query", limit=limit)
+        with patch("code_review_graph.embeddings._np", None):
+            python_results = store.search("query", limit=limit)
+        return numpy_results, python_results
+
+    @staticmethod
+    def _assert_equivalent(numpy_results, python_results):
+        assert [name for name, _ in numpy_results] == [
+            name for name, _ in python_results
+        ]
+        for (_, from_numpy), (_, from_python) in zip(numpy_results, python_results):
+            assert abs(from_numpy - from_python) < 1e-6
+
+    def test_ranking_matches_python_backend(self, tmp_path):
+        store = self._store_with_vectors(
+            tmp_path,
+            [
+                ("orthogonal", [0.0, 1.0, 0.0]),
+                ("aligned", [2.0, 0.0, 0.0]),
+                ("opposed", [-1.0, 0.0, 0.0]),
+                ("partial", [1.0, 1.0, 0.0]),
+            ],
+        )
+        try:
+            numpy_results, python_results = self._both_backends(store)
+            self._assert_equivalent(numpy_results, python_results)
+            assert [name for name, _ in numpy_results] == [
+                "aligned",
+                "partial",
+                "orthogonal",
+                "opposed",
+            ]
+            assert abs(numpy_results[0][1] - 1.0) < 1e-6
+        finally:
+            store.close()
+
+    def test_zero_magnitude_vector_scores_zero_in_both(self, tmp_path):
+        store = self._store_with_vectors(
+            tmp_path,
+            [("zero", [0.0, 0.0, 0.0]), ("aligned", [1.0, 0.0, 0.0])],
+        )
+        try:
+            numpy_results, python_results = self._both_backends(store)
+            self._assert_equivalent(numpy_results, python_results)
+            assert dict(numpy_results)["zero"] == 0.0
+        finally:
+            store.close()
+
+    def test_dimension_mismatch_scores_zero_without_raising(self, tmp_path):
+        """A stale row from a previous model must not break the whole query."""
+        store = self._store_with_vectors(
+            tmp_path,
+            [
+                ("wrong_dimension", [1.0, 0.0, 0.0, 0.0, 0.0]),
+                ("aligned", [1.0, 0.0, 0.0]),
+            ],
+        )
+        try:
+            numpy_results, python_results = self._both_backends(store)
+            self._assert_equivalent(numpy_results, python_results)
+            assert dict(numpy_results)["wrong_dimension"] == 0.0
+            assert numpy_results[0][0] == "aligned"
+        finally:
+            store.close()
+
+    def test_all_vectors_mismatched(self, tmp_path):
+        store = self._store_with_vectors(
+            tmp_path,
+            [("a", [1.0, 0.0]), ("b", [0.0, 1.0])],
+        )
+        try:
+            numpy_results, python_results = self._both_backends(store)
+            self._assert_equivalent(numpy_results, python_results)
+            assert {score for _, score in numpy_results} == {0.0}
+        finally:
+            store.close()
+
+    def test_zero_magnitude_query_scores_everything_zero(self, tmp_path):
+        store = self._store_with_vectors(
+            tmp_path,
+            [("aligned", [1.0, 0.0, 0.0]), ("other", [0.0, 1.0, 0.0])],
+            query_vec=[0.0, 0.0, 0.0],
+        )
+        try:
+            numpy_results, python_results = self._both_backends(store)
+            self._assert_equivalent(numpy_results, python_results)
+            assert {score for _, score in numpy_results} == {0.0}
+        finally:
+            store.close()
+
+    def test_ties_preserve_insertion_order_in_both(self, tmp_path):
+        store = self._store_with_vectors(
+            tmp_path,
+            [(f"tied_{index}", [1.0, 0.0, 0.0]) for index in range(6)],
+        )
+        try:
+            numpy_results, python_results = self._both_backends(store)
+            self._assert_equivalent(numpy_results, python_results)
+            assert [name for name, _ in numpy_results] == [
+                f"tied_{index}" for index in range(6)
+            ]
+        finally:
+            store.close()
+
+    def test_limit_truncates_after_ranking(self, tmp_path):
+        store = self._store_with_vectors(
+            tmp_path,
+            [
+                ("worst", [-1.0, 0.0, 0.0]),
+                ("best", [1.0, 0.0, 0.0]),
+                ("middle", [1.0, 1.0, 0.0]),
+            ],
+        )
+        try:
+            numpy_results, python_results = self._both_backends(store, limit=2)
+            self._assert_equivalent(numpy_results, python_results)
+            assert [name for name, _ in numpy_results] == ["best", "middle"]
+        finally:
+            store.close()
+
+    def test_empty_table_returns_empty_in_both(self, tmp_path):
+        store = self._store_with_vectors(tmp_path, [])
+        try:
+            numpy_results, python_results = self._both_backends(store)
+            assert numpy_results == []
+            assert python_results == []
+        finally:
+            store.close()
+
+    def test_rows_from_another_provider_identity_are_excluded(self, tmp_path):
+        store = self._store_with_vectors(tmp_path, [("mine", [1.0, 0.0, 0.0])])
+        try:
+            store._conn.execute(
+                "INSERT INTO embeddings (qualified_name, vector, text_hash, provider) "
+                "VALUES (?, ?, ?, ?)",
+                ("theirs", _encode_vector([1.0, 0.0, 0.0]), "hash", "other:model"),
+            )
+            store._conn.commit()
+            numpy_results, python_results = self._both_backends(store)
+            self._assert_equivalent(numpy_results, python_results)
+            assert [name for name, _ in numpy_results] == ["mine"]
+        finally:
+            store.close()

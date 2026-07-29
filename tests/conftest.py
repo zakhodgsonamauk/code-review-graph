@@ -11,6 +11,42 @@ from __future__ import annotations
 
 import pytest
 
+# Every environment variable that can select or configure an embedding
+# provider. A developer with a working local embedding setup exports these
+# permanently, so they leak into the suite unless cleared per test.
+_EMBEDDING_ENV_VARS = (
+    "CRG_OPENAI_API_KEY",
+    "CRG_OPENAI_BASE_URL",
+    "CRG_OPENAI_MODEL",
+    "CRG_OPENAI_DIMENSION",
+    "CRG_OPENAI_BATCH_SIZE",
+    "CRG_EMBEDDING_PROVIDER",
+    "CRG_EMBEDDING_MODEL",
+    "CRG_AUTO_EMBED_REFRESH",
+    "CRG_ACCEPT_CLOUD_EMBEDDINGS",
+    "GOOGLE_API_KEY",
+    "MINIMAX_API_KEY",
+)
+
+
+@pytest.fixture(autouse=True)
+def isolated_embedding_env(monkeypatch):
+    """Clear embedding provider configuration inherited from the machine.
+
+    ``get_provider()`` selects the openai provider whenever
+    ``CRG_OPENAI_API_KEY`` and ``CRG_OPENAI_BASE_URL`` are set, and builds
+    infer a refresh identity from the same variables. Both are correct in
+    production and both make the suite machine-dependent: a developer running
+    a local Ollama endpoint would see "refresh is off by default" assertions
+    fail, while CI passes.
+
+    Autouse and unconditional, matching ``isolated_crg_home``. Tests that
+    want a provider configured set the variables they need with
+    ``monkeypatch.setenv``, which applies after this fixture has run.
+    """
+    for name in _EMBEDDING_ENV_VARS:
+        monkeypatch.delenv(name, raising=False)
+
 
 @pytest.fixture(autouse=True)
 def isolated_crg_home(tmp_path_factory, monkeypatch):

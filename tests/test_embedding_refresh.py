@@ -440,3 +440,155 @@ class TestRefreshWiring:
             embedding_provider="local",
             embedding_model="test-model",
         )
+
+
+class TestInferredRefreshIdentity:
+    """Builds keep an existing index fresh without per-invocation flags.
+
+    Git hooks and other automation call ``code-review-graph update`` with no
+    arguments, so a flags-only refresh never runs and semantic search silently
+    drifts behind the graph. Inference closes that gap; these tests pin the
+    conditions under which it does and does not fire.
+    """
+
+    def test_openai_credentials_infer_provider_and_model(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("CRG_OPENAI_API_KEY", "ollama")
+        monkeypatch.setenv("CRG_OPENAI_BASE_URL", "http://127.0.0.1:11434/v1")
+        monkeypatch.setenv("CRG_OPENAI_MODEL", "qwen3-embedding:4b")
+        graph, _ = _graph_with_function(tmp_path)
+        try:
+            with patch(
+                "code_review_graph.embeddings.refresh_embeddings",
+                return_value={"embedded": 4, "purged": 0},
+            ) as refresh:
+                result: dict = {}
+                _run_postprocess(graph, result, "none")
+            refresh.assert_called_once_with(
+                graph,
+                provider="openai",
+                model="qwen3-embedding:4b",
+            )
+            assert result["embeddings_refreshed"] == 4
+        finally:
+            graph.close()
+
+    def test_explicit_provider_env_overrides_credential_inference(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("CRG_OPENAI_API_KEY", "ollama")
+        monkeypatch.setenv("CRG_OPENAI_BASE_URL", "http://127.0.0.1:11434/v1")
+        monkeypatch.setenv("CRG_OPENAI_MODEL", "qwen3-embedding:4b")
+        monkeypatch.setenv("CRG_EMBEDDING_PROVIDER", "local")
+        monkeypatch.setenv("CRG_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+        graph, _ = _graph_with_function(tmp_path)
+        try:
+            with patch(
+                "code_review_graph.embeddings.refresh_embeddings",
+                return_value={"embedded": 1, "purged": 0},
+            ) as refresh:
+                _run_postprocess(graph, {}, "none")
+            refresh.assert_called_once_with(
+                graph,
+                provider="local",
+                model="all-MiniLM-L6-v2",
+            )
+        finally:
+            graph.close()
+
+    def test_explicit_arguments_win_over_environment(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("CRG_OPENAI_API_KEY", "ollama")
+        monkeypatch.setenv("CRG_OPENAI_BASE_URL", "http://127.0.0.1:11434/v1")
+        monkeypatch.setenv("CRG_OPENAI_MODEL", "qwen3-embedding:4b")
+        graph, _ = _graph_with_function(tmp_path)
+        try:
+            with patch(
+                "code_review_graph.embeddings.refresh_embeddings",
+                return_value={"embedded": 1, "purged": 0},
+            ) as refresh:
+                _run_postprocess(
+                    graph,
+                    {},
+                    "none",
+                    embedding_provider="local",
+                    embedding_model="test-model",
+                )
+            refresh.assert_called_once_with(
+                graph,
+                provider="local",
+                model="test-model",
+            )
+        finally:
+            graph.close()
+
+    @pytest.mark.parametrize("opt_out", ["0", "false", "no", "off", "OFF"])
+    def test_opt_out_env_disables_inference(self, monkeypatch, tmp_path, opt_out):
+        monkeypatch.setenv("CRG_OPENAI_API_KEY", "ollama")
+        monkeypatch.setenv("CRG_OPENAI_BASE_URL", "http://127.0.0.1:11434/v1")
+        monkeypatch.setenv("CRG_OPENAI_MODEL", "qwen3-embedding:4b")
+        monkeypatch.setenv("CRG_AUTO_EMBED_REFRESH", opt_out)
+        graph, _ = _graph_with_function(tmp_path)
+        try:
+            with patch(
+                "code_review_graph.embeddings.refresh_embeddings",
+            ) as refresh:
+                _run_postprocess(graph, {}, "none")
+            refresh.assert_not_called()
+        finally:
+            graph.close()
+
+    @pytest.mark.parametrize(
+        "env",
+        [
+            {"CRG_OPENAI_API_KEY": "ollama"},
+            {"CRG_OPENAI_BASE_URL": "http://127.0.0.1:11434/v1"},
+            {
+                "CRG_OPENAI_API_KEY": "ollama",
+                "CRG_OPENAI_BASE_URL": "http://127.0.0.1:11434/v1",
+            },
+            {"CRG_EMBEDDING_PROVIDER": "local"},
+            {"CRG_EMBEDDING_PROVIDER": "google", "CRG_EMBEDDING_MODEL": "gemini"},
+        ],
+        ids=[
+            "key-only",
+            "base-url-only",
+            "credentials-without-model",
+            "provider-without-model",
+            "provider-without-model-env-mapping",
+        ],
+    )
+    def test_partial_configuration_is_a_silent_no_op(self, monkeypatch, tmp_path, env):
+        """A half-configured machine must not warn on every build."""
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        graph, _ = _graph_with_function(tmp_path)
+        try:
+            warnings = []
+            with patch(
+                "code_review_graph.embeddings.refresh_embeddings",
+            ) as refresh:
+                warnings = _run_postprocess(graph, {}, "none")
+            refresh.assert_not_called()
+            assert warnings == []
+        finally:
+            graph.close()
+
+    def test_never_embedded_graph_is_untouched_by_inference(self, monkeypatch, tmp_path):
+        """The real safety net: refresh_embeddings bails before provider resolution.
+
+        Inference hands over an identity, but a graph holding no vectors must
+        still not load a model or reach an endpoint. Asserted against the real
+        ``refresh_embeddings`` rather than a mock, with no reachable endpoint
+        configured, so a regression here surfaces as an error rather than a
+        silent network call.
+        """
+        monkeypatch.setenv("CRG_OPENAI_API_KEY", "unused")
+        monkeypatch.setenv("CRG_OPENAI_BASE_URL", "http://127.0.0.1:9/v1")
+        monkeypatch.setenv("CRG_OPENAI_MODEL", "should-never-be-loaded")
+        graph, _ = _graph_with_function(tmp_path)
+        try:
+            result: dict = {}
+            warnings = _run_postprocess(graph, result, "none")
+            assert warnings == []
+            assert "embeddings_refreshed" not in result
+        finally:
+            graph.close()

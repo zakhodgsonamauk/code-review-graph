@@ -392,6 +392,10 @@ eval = [
 google-embeddings = [
     { name = "google-generativeai" },
 ]
+perf = [
+    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
+    { name = "numpy", version = "2.4.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+]
 wiki = [
     { name = "ollama" },
 ]
@@ -408,6 +412,7 @@ requires-dist = [
     { name = "code-review-graph", extras = ["embeddings"], marker = "extra == 'all'" },
     { name = "code-review-graph", extras = ["enrichment"], marker = "extra == 'all'" },
     { name = "code-review-graph", extras = ["eval"], marker = "extra == 'all'" },
+    { name = "code-review-graph", extras = ["perf"], marker = "extra == 'all'" },
     { name = "code-review-graph", extras = ["wiki"], marker = "extra == 'all'" },
     { name = "fastmcp", specifier = ">=3.2.4,<4" },
     { name = "google-generativeai", marker = "extra == 'google-embeddings'", specifier = ">=0.8.0,<1" },
@@ -418,6 +423,7 @@ requires-dist = [
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10,<2" },
     { name = "networkx", specifier = ">=3.2,<4" },
     { name = "numpy", marker = "extra == 'embeddings'", specifier = ">=1.26,<3" },
+    { name = "numpy", marker = "extra == 'perf'", specifier = ">=1.26,<3" },
     { name = "ollama", marker = "extra == 'wiki'", specifier = ">=0.1.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0,<9" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23,<2" },
@@ -432,7 +438,7 @@ requires-dist = [
     { name = "tree-sitter-language-pack", specifier = ">=0.3.0,<1" },
     { name = "watchdog", specifier = ">=4.0.0,<7" },
 ]
-provides-extras = ["embeddings", "google-embeddings", "communities", "eval", "wiki", "all", "enrichment", "dev"]
+provides-extras = ["embeddings", "google-embeddings", "perf", "communities", "eval", "wiki", "all", "enrichment", "dev"]
 
 [package.metadata.requires-dev]
 dev = [

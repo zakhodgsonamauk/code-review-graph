@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import time
 from typing import Any
@@ -16,6 +17,61 @@ from ._common import _get_store
 
 logger = logging.getLogger(__name__)
 
+# Set to any of these to stop builds inferring a refresh identity from the
+# environment. Explicit provider/model arguments are unaffected.
+_AUTO_REFRESH_OPT_OUT = frozenset({"0", "false", "no", "off"})
+_AUTO_REFRESH_ENV = "CRG_AUTO_EMBED_REFRESH"
+
+# Provider chosen when the caller passes neither provider nor model.
+_PROVIDER_ENV = "CRG_EMBEDDING_PROVIDER"
+
+# Per-provider env var holding the exact model an inferred refresh must use.
+# Providers absent from this map cannot be inferred, because a refresh must
+# name one exact model and guessing one risks silently re-embedding a graph
+# under a different identity.
+_MODEL_ENV_BY_PROVIDER = {
+    "openai": "CRG_OPENAI_MODEL",
+    "local": "CRG_EMBEDDING_MODEL",
+}
+
+
+def _infer_refresh_identity() -> tuple[str | None, str | None]:
+    """Derive a (provider, model) refresh identity from the environment.
+
+    Returns ``(None, None)`` unless the environment names both halves, so a
+    partially configured machine is a silent no-op rather than a warning on
+    every build.
+
+    This does not weaken the "never embed unexpectedly" guarantee: the
+    inferred identity is still handed to ``refresh_embeddings``, which returns
+    before resolving a provider when the graph holds no vectors. A graph that
+    has never been embedded therefore still cannot load a local model, reach a
+    cloud endpoint, or incur API cost. Only an already-embedded graph is kept
+    in step with the code, which is what the caller asked for when they
+    embedded it in the first place.
+    """
+    if os.environ.get(_AUTO_REFRESH_ENV, "").strip().lower() in _AUTO_REFRESH_OPT_OUT:
+        return None, None
+
+    provider = os.environ.get(_PROVIDER_ENV, "").strip().lower()
+    if not provider:
+        # Mirrors get_provider(): configured OpenAI-compatible credentials
+        # select the openai provider when nothing else is specified.
+        if os.environ.get("CRG_OPENAI_API_KEY") and os.environ.get(
+            "CRG_OPENAI_BASE_URL"
+        ):
+            provider = "openai"
+        else:
+            return None, None
+
+    model_env = _MODEL_ENV_BY_PROVIDER.get(provider)
+    if model_env is None:
+        return None, None
+    model = os.environ.get(model_env, "").strip()
+    if not model:
+        return None, None
+    return provider, model
+
 
 def _run_embedding_refresh(
     store: Any,
@@ -25,9 +81,17 @@ def _run_embedding_refresh(
     provider: str | None,
     model: str | None,
 ) -> None:
-    """Run a provider-scoped embedding refresh only when explicitly requested."""
+    """Run a provider-scoped embedding refresh.
+
+    The identity is taken from the explicit arguments when given, otherwise
+    inferred from the environment so routine builds keep an existing index in
+    step with the graph. See ``_infer_refresh_identity`` for why inference is
+    safe for graphs that have never been embedded.
+    """
     if provider is None and model is None:
-        return
+        provider, model = _infer_refresh_identity()
+        if provider is None and model is None:
+            return
     if not provider or not model:
         warning = "Embedding refresh requires both an explicit provider and model."
         logger.warning(warning)
