@@ -846,7 +846,9 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 _IDENTIFIER_SPLIT_RE = re.compile(r"([a-z])([A-Z])|[_./\-]+")
-_MAX_EMBEDDED_DOCSTRING_CHARS = 400
+# Kept equal to the parser's _MAX_DOCSTRING_CHARS. Applied defensively because
+# an existing database may hold values written under an older, larger bound.
+_MAX_EMBEDDED_DOCSTRING_CHARS = 1200
 
 
 def _split_identifier(name: str) -> str:

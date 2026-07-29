@@ -3,10 +3,13 @@
 from pathlib import Path
 from unittest.mock import patch
 
-from code_review_graph.embeddings import _node_to_text
+from code_review_graph.embeddings import (
+    _MAX_EMBEDDED_DOCSTRING_CHARS,
+    _node_to_text,
+)
 from code_review_graph.graph import GraphNode, GraphStore
 from code_review_graph.incremental import full_build, incremental_update
-from code_review_graph.parser import CodeParser
+from code_review_graph.parser import _MAX_DOCSTRING_CHARS, CodeParser
 
 
 def _parsed_node(path: str, source: bytes, name: str):
@@ -196,14 +199,21 @@ class TestDocumentationSummaryExtraction:
 
         assert node.extra["docstring"] == "Parse a typed sheet."
 
-    def test_summary_is_bounded_to_four_hundred_characters(self):
+    def test_summary_is_bounded_by_the_configured_maximum(self):
+        oversized = "word " * (_MAX_DOCSTRING_CHARS // 2)
         node = _parsed_node(
             "module.py",
-            ('def f():\n    """' + ("word " * 200) + '"""\n').encode(),
+            ('def f():\n    """' + oversized + '"""\n').encode(),
             "f",
         )
 
-        assert len(node.extra["docstring"]) == 400
+        assert len(oversized) > _MAX_DOCSTRING_CHARS, "input must exceed the bound"
+        assert len(node.extra["docstring"]) == _MAX_DOCSTRING_CHARS
+
+    def test_embedded_text_bound_matches_the_parser_bound(self):
+        """A larger embedding-side bound would be dead code, a smaller one a
+        silent second truncation. Neither is intended."""
+        assert _MAX_EMBEDDED_DOCSTRING_CHARS == _MAX_DOCSTRING_CHARS
 
 
 class TestDocumentationEmbeddingText:
@@ -227,14 +237,15 @@ class TestDocumentationEmbeddingText:
         )
 
     def test_text_includes_normalized_bounded_summary_deterministically(self):
-        summary = "  Parse\n uploaded\t rate sheets.  " + ("x" * 500)
+        overshoot = "x" * (_MAX_EMBEDDED_DOCSTRING_CHARS + 100)
+        summary = "  Parse\n uploaded\t rate sheets.  " + overshoot
 
         first = _node_to_text(self._node({"docstring": summary}))
         second = _node_to_text(self._node({"docstring": summary}))
 
         assert first == second
         assert "Parse uploaded rate sheets." in first
-        assert ("x" * 401) not in first
+        assert ("x" * (_MAX_EMBEDDED_DOCSTRING_CHARS + 1)) not in first
 
     def test_non_string_legacy_metadata_is_ignored(self):
         plain = _node_to_text(self._node({}))

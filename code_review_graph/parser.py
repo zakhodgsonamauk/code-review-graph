@@ -1770,7 +1770,12 @@ def _is_test_function(
 # schema remains backward compatible.  A hard cap keeps parser metadata and
 # semantic-search input bounded even when a source file contains a very long
 # API reference as its docstring.
-_MAX_DOCSTRING_CHARS = 400
+# Bound on the stored documentation summary. This is the binding cap: the
+# embedding layer re-applies its own bound to the value read back, so raising
+# that one alone has no effect. Only the first paragraph reaches here anyway
+# (see _clean_docstring_summary), so this ceiling rarely binds -- it exists to
+# stop a pathological single-paragraph docstring dominating a node's text.
+_MAX_DOCSTRING_CHARS = 1200
 _DOC_COMMENT_NODE_TYPES = frozenset({
     "comment",
     "block_comment",
