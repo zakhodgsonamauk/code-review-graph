@@ -18,7 +18,7 @@ def _parsed_node(path: str, source: bytes, name: str):
 
 
 class TestDocumentationSummaryExtraction:
-    def test_python_uses_runtime_string_value_and_first_paragraph(self):
+    def test_python_uses_runtime_string_value_and_keeps_later_paragraphs(self):
         node = _parsed_node(
             "module.py",
             (
@@ -29,7 +29,9 @@ class TestDocumentationSummaryExtraction:
             "parse_rates",
         )
 
-        assert node.extra["docstring"] == (r"Parse\n uploaded " + "\N{EURO SIGN} rate sheets.")
+        assert node.extra["docstring"] == (
+            r"Parse\n uploaded " + "\N{EURO SIGN} rate sheets. Details."
+        )
 
     def test_python_rejects_bytes_and_fstrings(self):
         for literal in (b'b"not docs"', b'f"not {1} docs"'):
@@ -291,3 +293,137 @@ def test_docstring_metadata_survives_full_and_incremental_persistence(
         assert "docstring" not in removed_node.extra
     finally:
         store.close()
+
+
+class TestProseParagraphCapture:
+    """Python docstrings keep later paragraphs; tag-based doc comments do not.
+
+    Measured on a 19,595-node Django/React graph: 27.5% of nodes are
+    documented, the median stored summary was 66 characters, and 26.8% of
+    Python docstrings had a further 258 characters (p90 692) sitting unused
+    past the first paragraph. Only 2.4% used Google/NumPy section headings, so
+    paragraph capture -- not section parsing -- is where the signal is.
+    """
+
+    def test_python_joins_multiple_prose_paragraphs(self):
+        node = _parsed_node(
+            "module.py",
+            (
+                b"def resolve():\n"
+                b'    """Resolve the working file.\n'
+                b"\n"
+                b"    Falls back to the staging area when the local copy is absent.\n"
+                b"\n"
+                b"    Callers must hold the case lock.\n"
+                b'    """\n'
+                b"    return None\n"
+            ),
+            "resolve",
+        )
+
+        assert node.extra["docstring"] == (
+            "Resolve the working file. "
+            "Falls back to the staging area when the local copy is absent. "
+            "Callers must hold the case lock."
+        )
+
+    def test_python_stops_at_a_parameter_section(self):
+        """Parameter names already live in NodeInfo.params."""
+        node = _parsed_node(
+            "module.py",
+            (
+                b"def resolve(case_no):\n"
+                b'    """Resolve the working file.\n'
+                b"\n"
+                b"    Prefers the local copy.\n"
+                b"\n"
+                b"    Args:\n"
+                b"        case_no: the case reference\n"
+                b'    """\n'
+                b"    return None\n"
+            ),
+            "resolve",
+        )
+
+        docstring = node.extra["docstring"]
+        assert docstring == "Resolve the working file. Prefers the local copy."
+        assert "case_no" not in docstring
+
+    def test_python_keeps_a_returns_section_when_no_parameters_precede_it(self):
+        node = _parsed_node(
+            "module.py",
+            (
+                b"def resolve():\n"
+                b'    """Resolve the working file.\n'
+                b"\n"
+                b"    Returns:\n"
+                b"        The absolute NAS path, or None when unavailable.\n"
+                b'    """\n'
+                b"    return None\n"
+            ),
+            "resolve",
+        )
+
+        assert "absolute NAS path" in node.extra["docstring"]
+
+    def test_python_drops_numpy_section_underlines(self):
+        node = _parsed_node(
+            "module.py",
+            (
+                b"def resolve():\n"
+                b'    """Resolve the working file.\n'
+                b"\n"
+                b"    Notes\n"
+                b"    -----\n"
+                b"    Requires the NAS to be awake.\n"
+                b'    """\n'
+                b"    return None\n"
+            ),
+            "resolve",
+        )
+
+        docstring = node.extra["docstring"]
+        assert "-----" not in docstring
+        assert "Requires the NAS to be awake." in docstring
+
+    def test_python_bound_applies_across_joined_paragraphs(self):
+        paragraphs = b"\n\n".join(
+            b"    " + (b"word " * 60) for _ in range(6)
+        )
+        node = _parsed_node(
+            "module.py",
+            b'def f():\n    """Summary.\n\n' + paragraphs + b'\n    """\n',
+            "f",
+        )
+
+        assert len(node.extra["docstring"]) == _MAX_DOCSTRING_CHARS
+
+    def test_tag_based_doc_comments_still_keep_only_the_first_paragraph(self):
+        """Later Javadoc/Doxygen paragraphs are implementation detail."""
+        java = _parsed_node(
+            "Parser.java",
+            (
+                b"class Parser {\n"
+                b"  /**\n"
+                b"   * Parse a rate sheet.\n"
+                b"   *\n"
+                b"   * Implementation detail that must not be embedded.\n"
+                b"   */\n"
+                b"  void parse() {}\n"
+                b"}\n"
+            ),
+            "parse",
+        )
+        rust = _parsed_node(
+            "module.rs",
+            (
+                b"/// Parse a sheet.\n"
+                b"///\n"
+                b"/// Internal notes that must not be embedded.\n"
+                b"fn parse() {}\n"
+            ),
+            "parse",
+        )
+
+        assert java.extra["docstring"] == "Parse a rate sheet."
+        assert rust.extra["docstring"] == "Parse a sheet."

@@ -1802,9 +1802,37 @@ _DOC_INLINE_TAG_RE = re.compile(
 )
 _DOC_BRIEF_RE = re.compile(r"^\s*[@\\]brief\s+", re.IGNORECASE)
 
+# Languages whose docstrings are free prose, where paragraphs after the first
+# carry meaning worth embedding. Tag-based doc comments (Javadoc, JSDoc,
+# Doxygen, C# XML) are excluded deliberately: their later paragraphs are
+# implementation detail behind <p>, and C# already narrows to <summary>.
+_PROSE_DOC_LANGUAGES = frozenset({"python"})
+
+# Parameter-listing section headings. Everything from here on is skipped: the
+# parameter names are already carried by NodeInfo.params, so embedding them
+# again only dilutes the vector. Note this also drops any Returns/Raises
+# section that follows, which measured at ~1.7% of docstrings -- recovering
+# those would mean parsing section structure, which the same measurement did
+# not justify.
+_PARAM_SECTION_RE = re.compile(
+    r"^(?:args|arguments|parameters|keyword args|keyword arguments|params)\s*:?$",
+    re.IGNORECASE,
+)
+
+# reStructuredText / NumPy section underlines ("-------", "=======") carry no
+# meaning once paragraphs are flattened into one line.
+_DOC_UNDERLINE_RE = re.compile(r"^[-=~^\"'#*+`]{3,}$")
+
 
 def _clean_docstring_summary(raw: str, language: str) -> str:
-    """Return a whitespace-stable, first-paragraph documentation summary."""
+    """Return a whitespace-stable documentation summary.
+
+    Prose languages (see ``_PROSE_DOC_LANGUAGES``) keep every paragraph up to
+    the character bound, because a node's embedded text is its only semantic
+    signal -- no code body reaches the vector -- and a median summary of ~66
+    characters is a thin basis for natural-language retrieval. Tag-based doc
+    comments keep the first paragraph only, as before.
+    """
     text = raw.replace("\r\n", "\n").replace("\r", "\n")
     if language == "csharp":
         summary = _CSHARP_SUMMARY_RE.search(text)
@@ -1817,17 +1845,25 @@ def _clean_docstring_summary(raw: str, language: str) -> str:
         text = html.unescape(text)
         text = _DOC_BRIEF_RE.sub("", text)
 
+    keep_later_paragraphs = language in _PROSE_DOC_LANGUAGES
     lines = [line.strip() for line in text.splitlines()]
     while lines and not lines[0]:
         lines.pop(0)
-    paragraph: list[str] = []
+    collected: list[str] = []
     for line in lines:
         if not line:
+            if keep_later_paragraphs:
+                continue
             break
-        if paragraph and line.startswith(("@param", "@return", "\\param", "\\return")):
+        if collected and line.startswith(("@param", "@return", "\\param", "\\return")):
             break
-        paragraph.append(line)
-    return " ".join(" ".join(paragraph).split())[:_MAX_DOCSTRING_CHARS]
+        if keep_later_paragraphs:
+            if _PARAM_SECTION_RE.match(line):
+                break
+            if _DOC_UNDERLINE_RE.match(line):
+                continue
+        collected.append(line)
+    return " ".join(" ".join(collected).split())[:_MAX_DOCSTRING_CHARS]
 
 
 def _strip_block_doc_comment(text: str) -> str:
