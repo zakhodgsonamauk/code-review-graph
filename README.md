@@ -515,6 +515,7 @@ Optional dependency groups:
 
 ```bash
 pip install "code-review-graph[embeddings]"          # Local vector embeddings (sentence-transformers)
+pip install "code-review-graph[perf]"                # Vectorised semantic search (NumPy only, no torch)
 pip install "code-review-graph[google-embeddings]"   # Google Gemini embeddings
 pip install "code-review-graph[communities]"         # Community detection (igraph)
 pip install "code-review-graph[enrichment]"          # Python call-resolution enrichment (Jedi)
@@ -523,6 +524,35 @@ pip install "code-review-graph[wiki]"                # Wiki generation with LLM 
 pip install "code-review-graph[all]"                 # All optional dependencies
 ```
 
+### Embedding settings file
+
+Environment variables are not reliably present in every process that needs to
+embed. A git hook inherits the shell that ran `git commit`, and an MCP server
+keeps whatever environment it started with for its entire life — so both can
+miss variables exported later, and silently skip refreshing the index while the
+graph moves on without it.
+
+Settings can therefore also live in `embeddings.toml` under the state directory
+(`~/.code-review-graph/`, or `$CRG_HOME` when set):
+
+```toml
+provider   = "openai"
+model      = "qwen3-embedding:4b"
+base_url   = "http://127.0.0.1:11434/v1"   # e.g. Ollama's OpenAI-compatible endpoint
+api_key    = "ollama"                      # required non-empty; local servers ignore the value
+dimension  = 512                           # optional, for Matryoshka-capable models
+batch_size = 100                           # optional
+```
+
+Resolution order is **environment → this file → the identity already recorded in
+the index**. That last step recovers the model and endpoint an index was built
+with, but never the API key: credentials are deliberately kept out of the
+`embeddings.provider` column. A `[embeddings]` table heading is accepted, and a
+malformed file is ignored with a warning rather than being fatal.
+
+This file may contain an API key. It is only ever read, never written — creating
+it and choosing its permissions stays with you.
+
 ### Environment Variables
 
 | Variable | Description | Default |
@@ -530,6 +560,9 @@ pip install "code-review-graph[all]"                 # All optional dependencies
 | `CRG_GIT_TIMEOUT` | Timeout in seconds for Git operations | `30` |
 | `CRG_DATA_DIR` | Override directory for graph databases and generated graph artefacts | - |
 | `CRG_EMBEDDING_MODEL` | Default model for vector embeddings | `all-MiniLM-L6-v2` |
+| `CRG_EMBEDDING_PROVIDER` | Provider used when none is passed explicitly (`local`, `openai`, `google`, `minimax`) | - |
+| `CRG_EMBED_KINDS` | Comma-separated node kinds to embed. A blank value falls back to the default rather than embedding nothing | `Class,Function,Type` |
+| `CRG_AUTO_EMBED_REFRESH` | Set to `0`/`false`/`no`/`off` to stop `build`/`update` refreshing an existing index | enabled |
 | `CRG_ACCEPT_CLOUD_EMBEDDINGS` | Suppress the cloud embedding egress warning after explicit acknowledgement | - |
 | `CRG_ALLOW_REMOTE_CODE` | Allow HuggingFace models that require `trust_remote_code=True` | `0` |
 | `CRG_MAX_IMPACT_NODES` | Maximum nodes to include in impact analysis | `500` |

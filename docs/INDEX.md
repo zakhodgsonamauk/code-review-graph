@@ -6,6 +6,7 @@
 - [COMMANDS.md](COMMANDS.md) -- All 30 MCP tools, 5 MCP prompts, skills, and CLI commands
 - [GITHUB_ACTION.md](GITHUB_ACTION.md) -- Risk-scored PR review comments via GitHub Actions
 - [CUSTOM_LANGUAGES.md](CUSTOM_LANGUAGES.md) -- Bring your own language via `.code-review-graph/languages.toml`
+- [LOCAL_OLLAMA_SETUP.md](LOCAL_OLLAMA_SETUP.md) -- Repeatable semantic-search setup on a local Ollama GPU (no torch)
 - [LLM-OPTIMIZED-REFERENCE.md](LLM-OPTIMIZED-REFERENCE.md) -- Token-optimized reference for MCP-capable AI coding agents
 - [architecture.md](architecture.md) -- System design and data flow
 - [schema.md](schema.md) -- Graph node/edge schema, SQLite tables (including flows, communities, FTS5)

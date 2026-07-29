@@ -147,9 +147,67 @@ The graph uses SQLite with WAL mode. If you see lock errors:
 - Check that hooks are configured in `.claude/settings.json` (re-run `code-review-graph install` to regenerate)
 
 ## Embeddings not working
-- Install with: `pip install "code-review-graph[embeddings]"`
+- Install with: `pip install "code-review-graph[embeddings]"` for a local model, or
+  `[perf]` alone if you use a cloud / OpenAI-compatible endpoint and only need
+  NumPy for the vectorised search scan
 - Run `embed_graph_tool` to compute vectors
-- First embedding run downloads the model (~90MB, one time)
+- First embedding run with the local provider downloads the model (~90MB, one time)
+
+## Semantic search silently returns keyword results, or the index goes stale
+
+Two different silent failures, both diagnosable from one line of output.
+
+`build` and `update` always print an `Embeddings:` line — either
+`Embeddings: N refreshed, M purged` or `Embeddings: skipped (<reason>)`. If it
+says skipped, no provider could be resolved **in that process**, and the index
+stops tracking the graph while every other step reports success. New and renamed
+functions then stay invisible to semantic search; keyword/FTS search keeps
+working, which is what makes it easy to miss.
+
+The usual cause is a missing environment: a git hook inherits the shell that ran
+`git commit`, and an MCP server keeps whatever environment it started with. Fix
+it once by writing the settings to `~/.code-review-graph/embeddings.toml` (see
+the README) instead of relying on exported variables.
+
+Separately, `semantic_search_nodes` falls back to keyword matching when no
+vectors exist for the resolved provider identity. Identity includes the endpoint,
+so changing `base_url` or the model starts a new index rather than reusing the
+old one.
+
+## `bind: ... queue was full` part-way through a large embed (Windows)
+
+A local endpoint such as Ollama opens an internal socket per input. Embedding
+tens of thousands of nodes at full speed can push TIME_WAIT past the ephemeral
+port range (16,384 ports by default), and the endpoint reports the failure as
+HTTP 400 with a Go dial error in the body.
+
+These are retried with a long backoff (30s, 60s, 90s, 120s) because port
+reclamation takes tens of seconds, and vectors are committed per batch, so a
+failure costs one batch rather than the whole run — re-running resumes where it
+stopped. To avoid it entirely, widen the range (needs administrator):
+
+```powershell
+netsh int ipv4 set dynamicport tcp start=10000 num=55535
+```
+
+Check current pressure with `(Get-NetTCPConnection -State TimeWait).Count`.
+
+## Changes to an editable install don't take effect in Claude Code
+
+An `pip install -e` / `pipx install --editable` checkout updates what *new*
+processes import. A long-lived MCP server has already imported the package and
+keeps that code for its entire life, so it can run behaviour you have since
+changed on disk. Restart the MCP client after editing the package.
+
+## Graph database inside Dropbox / OneDrive / iCloud
+
+Supported. Sync clients hold files open to upload them, which surfaces as a
+brief `EPERM`/`EACCES` or a SQLite lock; connects and embedding writes retry
+five times with backoff. Genuine failures (a corrupt database, a missing
+directory) still fail immediately rather than after five sleeps.
+
+Note the database is rewritten by every build, so a large graph means repeated
+sync traffic. `CRG_DATA_DIR` relocates it if that becomes a problem.
 
 ## MCP server won't start
 - Verify `uv` is installed (`uv --version`; install with `pip install uv` or `brew install uv`)
