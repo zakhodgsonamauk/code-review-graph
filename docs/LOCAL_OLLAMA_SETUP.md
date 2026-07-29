@@ -61,7 +61,22 @@ should print `True`.
 
 ## 3. Configure once, for every project
 
-Write `~/.code-review-graph/embeddings.toml` (or `$CRG_HOME/embeddings.toml`):
+```bash
+code-review-graph setup-embeddings          # --print to preview, --force to replace
+```
+
+This asks the endpoint which installed models are embedding-capable, picks the
+best one it finds, probes the model to learn its native width and confirm it
+honours a smaller one, then writes the file below. Use `--model`, `--base-url`,
+`--dimension` or `--api-key` to override any decision.
+
+**Check:** the command prints the endpoint, model and dimension it recorded, and
+says whether the width is native or truncated.
+
+<details>
+<summary>Writing the file by hand instead</summary>
+
+`~/.code-review-graph/embeddings.toml` (or `$CRG_HOME/embeddings.toml`):
 
 ```toml
 provider  = "openai"
@@ -81,6 +96,13 @@ its cost scales with dimension: on ~12k vectors, 512 dimensions is ~110ms of
 scan, while the model's native 2560 would be ~8x that and ~5x the disk. Changing
 it later changes the provider identity and forces a full re-embed, so choose
 before the first pass.
+
+</details>
+
+Either way, prefer this file over exported environment variables. Git hooks
+inherit the shell that ran `git commit`, and an MCP server keeps whatever
+environment it started with — both routinely miss variables exported later and
+then silently skip refreshing the index.
 
 **Check:** in any git repo, `code-review-graph status` reports embedding
 availability without needing any `CRG_OPENAI_*` variable set.

@@ -315,9 +315,12 @@ code-review-graph update --brief --verify      # ...and cross-check vs tiktoken
 code-review-graph postprocess                  # Re-run flows, communities, FTS
 code-review-graph forget PATH [PATH ...]       # Drop parsed files from the graph (no full rebuild)
 code-review-graph forget src/legacy --dry-run  # Preview which files would be forgotten
+code-review-graph setup-embeddings             # Detect a local endpoint, write embeddings.toml
+code-review-graph setup-embeddings --print     # Preview the settings without writing them
 code-review-graph embed --provider local       # Compute vector embeddings for semantic search
 code-review-graph update --embedding-provider local --embedding-model all-MiniLM-L6-v2
-                                                # Explicitly refresh an existing index (default: off)
+                                                # Pin an exact identity; otherwise resolved from
+                                                # the environment, embeddings.toml, or the index
 
 # Monitor and inspect
 code-review-graph status                       # Graph statistics

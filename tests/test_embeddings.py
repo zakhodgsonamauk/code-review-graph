@@ -259,10 +259,15 @@ class TestGetProviderValidation:
         assert "voyage" in msg
         assert "Valid: local, openai, google, minimax" in msg
 
-    def test_case_and_whitespace_normalized_for_openai(self):
+    def test_case_and_whitespace_normalized_for_openai(self, isolated_crg_home):
         """'  OPENAI ' must route to the openai branch (and fail on its
-        missing env vars), not fall through to the local default."""
-        with patch.dict(os.environ, {}, clear=True):
+        missing settings), not fall through to the local default.
+
+        CRG_HOME is re-supplied because clear=True removes it, and without it
+        ``crg_home()`` falls back to the real home directory and reads whatever
+        embeddings.toml the developer running the suite happens to have.
+        """
+        with patch.dict(os.environ, {"CRG_HOME": str(isolated_crg_home)}, clear=True):
             with pytest.raises(ValueError, match="Missing required setting"):
                 get_provider("  OPENAI ")
 
@@ -1323,20 +1328,27 @@ class TestGetProviderOpenAI:
         assert isinstance(p, OpenAIEmbeddingProvider)
         assert p.name == "openai:text-embedding-3-small@http://127.0.0.1:3000/v1"
 
-    def test_missing_api_key_raises(self):
+    # These three clear the environment, which also removes CRG_HOME. Without
+    # re-supplying it, crg_home() falls back to the real home directory and the
+    # developer's own embeddings.toml supplies the "missing" setting -- passing
+    # on CI and failing on any configured machine.
+    def test_missing_api_key_raises(self, isolated_crg_home):
         env = {k: v for k, v in self._MIN_ENV.items() if k != "CRG_OPENAI_API_KEY"}
+        env["CRG_HOME"] = str(isolated_crg_home)
         with patch.dict("os.environ", env, clear=True):
             with pytest.raises(ValueError, match="CRG_OPENAI_API_KEY"):
                 get_provider("openai")
 
-    def test_missing_base_url_raises(self):
+    def test_missing_base_url_raises(self, isolated_crg_home):
         env = {k: v for k, v in self._MIN_ENV.items() if k != "CRG_OPENAI_BASE_URL"}
+        env["CRG_HOME"] = str(isolated_crg_home)
         with patch.dict("os.environ", env, clear=True):
             with pytest.raises(ValueError, match="CRG_OPENAI_BASE_URL"):
                 get_provider("openai")
 
-    def test_missing_model_raises(self):
+    def test_missing_model_raises(self, isolated_crg_home):
         env = {k: v for k, v in self._MIN_ENV.items() if k != "CRG_OPENAI_MODEL"}
+        env["CRG_HOME"] = str(isolated_crg_home)
         with patch.dict("os.environ", env, clear=True):
             with pytest.raises(ValueError, match="CRG_OPENAI_MODEL"):
                 get_provider("openai")

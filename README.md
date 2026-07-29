@@ -524,6 +524,75 @@ pip install "code-review-graph[wiki]"                # Wiki generation with LLM 
 pip install "code-review-graph[all]"                 # All optional dependencies
 ```
 
+### Setting up semantic search
+
+One command detects a local endpoint, chooses a model, verifies the vector width
+and records the result:
+
+```bash
+code-review-graph setup-embeddings          # add --print to see it without writing
+cd /your/project
+code-review-graph build && code-review-graph embed
+```
+
+`setup-embeddings` asks the endpoint which of its installed models are
+embedding-capable rather than guessing from names, then probes the model twice —
+once to learn its native width, once to confirm it honours a smaller one.
+
+Use `--model` for a specific model, `--base-url` for a remote or non-Ollama
+endpoint, `--dimension` to override the width, `--api-key` for a hosted service.
+
+#### Choosing parameters
+
+Measured on an RTX 4080 against a ~20k-node Python/JavaScript repository.
+
+**Model.** Retrieval quality tracks size, and the embedded text is short — a
+signature plus a documentation summary — so a long context window buys nothing.
+
+| Model | Download | Native dim | Suits |
+|---|---|---|---|
+| `qwen3-embedding:4b` | 2.5GB | 2560 | a dedicated GPU; best quality per query cost |
+| `qwen3-embedding:0.6b` | 639MB | 1024 | a modest GPU |
+| `embeddinggemma` | 622MB | 768 | a weak GPU or CPU-only |
+| `nomic-embed-text` | 274MB | 768 | already installed, adequate |
+
+Embedding models are **local-only**: Ollama Cloud serves chat models, not
+embeddings. For a machine without a usable GPU, prefer a smaller local model, or
+point `base_url` at another machine or a hosted API.
+
+**Dimension.** Search scans every stored vector, so this sets recurring query
+cost and disk, not just quality. Matryoshka-capable models (Qwen3, EmbeddingGemma)
+truncate gracefully, so a large model at a small width is usually the best trade.
+At ~12k vectors: 384 ≈ 1.3s, 512 ≈ 1.7s, 768 ≈ 2.6s, 2560 ≈ 8.3s of scan without
+NumPy; roughly 15x faster with the `[perf]` extra installed. Storage is
+`dimension x 4` bytes per vector.
+
+Dimension and model together form the provider identity, so changing either
+later forces a full re-embed. Choose before the first pass.
+
+**Context window.** Only VRAM changes; throughput and load time do not. A
+custom small-context variant is the same weights with a smaller KV cache:
+
+```bash
+printf 'FROM qwen3-embedding:4b\nPARAMETER num_ctx 2048\n' > Modelfile
+ollama create qwen3-embedding-ctx2048:4b -f Modelfile
+```
+
+| `num_ctx` | VRAM | Batch of 100 |
+|---|---|---|
+| 2048 | 4.1GB | 1.37s |
+| 8192 | 5.0GB | 1.60s |
+| 40960 (stock) | 10.0GB | 1.39s |
+
+Leave real headroom: input past the window is **silently truncated**. A node's
+text measured 301 tokens at worst with a 1200-character documentation bound, so
+2048 is comfortable.
+
+**Keeping the model loaded.** Ollama unloads after 5 minutes by default, and a
+cold load costs ~2.5s on the next query against ~0.16s warm. `OLLAMA_KEEP_ALIVE`
+extends it — worth pairing with a small context so the resident cost is a few GB
+rather than ten.
+
 ### Embedding settings file
 
 Environment variables are not reliably present in every process that needs to

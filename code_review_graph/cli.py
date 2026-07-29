@@ -49,6 +49,8 @@ from importlib.metadata import version as pkg_version
 from pathlib import Path
 from typing import Iterable, TypedDict
 
+from .embedding_setup import DEFAULT_BASE_URL
+
 logger = logging.getLogger(__name__)
 
 # Shared platform choices for install and init commands
@@ -830,6 +832,45 @@ def main() -> None:
     )
     _add_embedding_refresh_args(pp_cmd)
 
+    # setup-embeddings
+    setup_cmd = sub.add_parser(
+        "setup-embeddings",
+        help="Detect a local embedding endpoint and write embeddings.toml",
+    )
+    setup_cmd.add_argument(
+        "--base-url",
+        default=None,
+        help=f"OpenAI-compatible endpoint (default: {DEFAULT_BASE_URL})",
+    )
+    setup_cmd.add_argument(
+        "--model",
+        default=None,
+        help="Embedding model to record. Default: the best installed model the "
+             "endpoint reports as embedding-capable",
+    )
+    setup_cmd.add_argument(
+        "--dimension",
+        type=_non_negative_int,
+        default=None,
+        help="Target vector width. Default: 512, or the model's native width "
+             "when it cannot truncate. Search cost scales with this",
+    )
+    setup_cmd.add_argument(
+        "--api-key",
+        default=None,
+        help="API key for the endpoint. Default: a placeholder, which local "
+             "servers such as Ollama ignore",
+    )
+    setup_cmd.add_argument(
+        "--force", action="store_true", help="Replace an existing embeddings.toml"
+    )
+    setup_cmd.add_argument(
+        "--print",
+        action="store_true",
+        dest="print_only",
+        help="Show the settings that would be written without writing them",
+    )
+
     # embed
     embed_cmd = sub.add_parser(
         "embed",
@@ -1574,6 +1615,59 @@ def main() -> None:
             print(f"Post-processing: {', '.join(parts) or 'done'}")
         finally:
             store.close()
+        return
+
+    if args.command == "setup-embeddings":
+        from .embedding_setup import SetupError, setup_embeddings
+
+        try:
+            summary = setup_embeddings(
+                base_url=args.base_url or DEFAULT_BASE_URL,
+                model=args.model,
+                dimension=args.dimension or None,
+                api_key=args.api_key,
+                force=args.force,
+                write=not args.print_only,
+            )
+        except SetupError as exc:
+            logging.error("%s", exc)
+            sys.exit(1)
+
+        available = summary["installed_embedding_models"]
+        if available:
+            print(f"Embedding models found: {', '.join(available)}")
+        print(f"Endpoint : {summary['base_url']}")
+        print(f"Model    : {summary['model']}")
+        if summary["dimension"] == summary["native_dimension"]:
+            print(f"Dimension: {summary['dimension']} (native)")
+        else:
+            print(
+                f"Dimension: {summary['dimension']} "
+                f"(truncated from {summary['native_dimension']})"
+            )
+        if not summary["truncation_honoured"]:
+            print(
+                "Note: the endpoint ignored the requested width, so the model's "
+                "native size is recorded instead."
+            )
+        if summary["written"]:
+            print(f"Wrote    : {summary['config_path']}")
+            print("Next     : code-review-graph build && code-review-graph embed")
+        else:
+            print(f"Would write to {summary['config_path']} (--print given):\n")
+            from .embedding_setup import render_config
+
+            print(render_config(
+                provider=summary["provider"],
+                model=summary["model"],
+                base_url=summary["base_url"],
+                api_key=args.api_key or "ollama",
+                dimension=(
+                    summary["dimension"]
+                    if summary["dimension"] != summary["native_dimension"]
+                    else None
+                ),
+            ))
         return
 
     if args.command == "embed":
