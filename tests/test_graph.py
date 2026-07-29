@@ -422,6 +422,13 @@ class TestGraphStore:
         assert stats.nodes_by_kind["Class"] == 1
         assert "python" in stats.languages
 
+    def test_has_nodes(self):
+        assert self.store.has_nodes() is False
+
+        self.store.upsert_node(self._make_file_node())
+
+        assert self.store.has_nodes() is True
+
     def test_impact_radius(self):
         # func_b depends on the changed func_a, so func_b is impacted.
         self.store.upsert_node(self._make_file_node("/a.py"))

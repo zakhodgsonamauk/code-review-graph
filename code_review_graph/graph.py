@@ -386,6 +386,10 @@ class GraphStore:
         row = self._conn.execute("SELECT value FROM metadata WHERE key=?", (key,)).fetchone()
         return row["value"] if row else None
 
+    def has_nodes(self) -> bool:
+        row = self._conn.execute("SELECT 1 FROM nodes LIMIT 1").fetchone()
+        return row is not None
+
     def has_nodes_for_language(self, language: str) -> bool:
         row = self._conn.execute(
             "SELECT 1 FROM nodes WHERE language = ? LIMIT 1",
