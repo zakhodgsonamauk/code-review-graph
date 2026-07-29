@@ -35,42 +35,98 @@ _MODEL_ENV_BY_PROVIDER = {
 }
 
 
-def _infer_refresh_identity() -> tuple[str | None, str | None]:
-    """Derive a (provider, model) refresh identity from the environment.
+def _stored_embedding_identities(store: Any) -> list[str]:
+    """Distinct provider identities already recorded in the index."""
+    try:
+        rows = store._conn.execute(
+            "SELECT DISTINCT provider FROM embeddings",
+        ).fetchall()
+    except sqlite3.Error:
+        return []
+    return [str(row[0]) for row in rows if row[0]]
 
-    Returns ``(None, None)`` unless the environment names both halves, so a
-    partially configured machine is a silent no-op rather than a warning on
-    every build.
+
+def _split_stored_identity(identity: str) -> tuple[str, str] | None:
+    """Recover ``(provider, model)`` from a stored identity string.
+
+    Identities look like ``local:all-MiniLM-L6-v2`` or, for OpenAI-compatible
+    backends, ``openai:model@http://host/v1``. The endpoint is deliberately
+    part of the identity, and credentials are deliberately not -- so this
+    recovers which model an index was built with, but the API key still has to
+    come from the environment or the config file.
+    """
+    provider, separator, remainder = identity.partition(":")
+    provider = provider.strip().lower()
+    if not separator or provider not in _MODEL_ENV_BY_PROVIDER:
+        return None
+    model = remainder.rsplit("@", 1)[0] if provider == "openai" else remainder
+    model = model.strip()
+    if not model:
+        return None
+    return provider, model
+
+
+def _resolve_refresh_identity(store: Any) -> tuple[str | None, str | None, str | None]:
+    """Resolve a refresh identity, returning ``(provider, model, skip_reason)``.
+
+    Tried in order: environment, the per-user config file, then the identity
+    already recorded in the index. The last of those matters because the two
+    processes most likely to run a refresh -- a git hook and a long-lived MCP
+    server -- both inherit whatever environment existed when they started, and
+    an index that already names its own model does not need to be told again.
 
     This does not weaken the "never embed unexpectedly" guarantee: the
-    inferred identity is still handed to ``refresh_embeddings``, which returns
-    before resolving a provider when the graph holds no vectors. A graph that
-    has never been embedded therefore still cannot load a local model, reach a
-    cloud endpoint, or incur API cost. Only an already-embedded graph is kept
-    in step with the code, which is what the caller asked for when they
-    embedded it in the first place.
+    identity is still handed to ``refresh_embeddings``, which returns before
+    resolving a provider when the graph holds no vectors. A graph that has
+    never been embedded still cannot load a local model, reach a cloud
+    endpoint, or incur API cost.
     """
     if os.environ.get(_AUTO_REFRESH_ENV, "").strip().lower() in _AUTO_REFRESH_OPT_OUT:
-        return None, None
+        return None, None, f"disabled by {_AUTO_REFRESH_ENV}"
 
-    provider = os.environ.get(_PROVIDER_ENV, "").strip().lower()
-    if not provider:
-        # Mirrors get_provider(): configured OpenAI-compatible credentials
-        # select the openai provider when nothing else is specified.
-        if os.environ.get("CRG_OPENAI_API_KEY") and os.environ.get(
-            "CRG_OPENAI_BASE_URL"
-        ):
-            provider = "openai"
-        else:
-            return None, None
+    from code_review_graph.embeddings import embedding_config_path, load_embedding_config
 
-    model_env = _MODEL_ENV_BY_PROVIDER.get(provider)
-    if model_env is None:
-        return None, None
-    model = os.environ.get(model_env, "").strip()
-    if not model:
-        return None, None
-    return provider, model
+    config = load_embedding_config()
+
+    provider = (
+        os.environ.get(_PROVIDER_ENV, "").strip().lower()
+        or config.get("provider", "").strip().lower()
+    )
+    if not provider and (
+        (os.environ.get("CRG_OPENAI_API_KEY") or config.get("api_key"))
+        and (os.environ.get("CRG_OPENAI_BASE_URL") or config.get("base_url"))
+    ):
+        # Mirrors get_provider(): configured OpenAI-compatible settings select
+        # the openai provider when nothing else is specified.
+        provider = "openai"
+
+    model = ""
+    if provider in _MODEL_ENV_BY_PROVIDER:
+        model = (
+            os.environ.get(_MODEL_ENV_BY_PROVIDER[provider], "").strip()
+            or config.get("model", "").strip()
+        )
+
+    if not provider or not model:
+        identities = _stored_embedding_identities(store)
+        if len(identities) == 1:
+            recovered = _split_stored_identity(identities[0])
+            if recovered is not None:
+                provider = provider or recovered[0]
+                model = model or recovered[1]
+        elif len(identities) > 1:
+            return None, None, (
+                f"index holds {len(identities)} provider identities; name one "
+                "explicitly to refresh it"
+            )
+
+    if not provider or not model:
+        return None, None, (
+            "no embedding provider configured -- set CRG_OPENAI_* or "
+            f"CRG_EMBEDDING_PROVIDER/CRG_EMBEDDING_MODEL, or create "
+            f"{embedding_config_path()}"
+        )
+    return provider, model, None
 
 
 def _run_embedding_refresh(
@@ -81,16 +137,27 @@ def _run_embedding_refresh(
     provider: str | None,
     model: str | None,
 ) -> None:
-    """Run a provider-scoped embedding refresh.
+    """Run a provider-scoped embedding refresh and record what happened.
 
     The identity is taken from the explicit arguments when given, otherwise
-    inferred from the environment so routine builds keep an existing index in
-    step with the graph. See ``_infer_refresh_identity`` for why inference is
-    safe for graphs that have never been embedded.
+    resolved by ``_resolve_refresh_identity`` so routine builds keep an
+    existing index in step with the graph.
+
+    A skipped refresh is recorded in ``result["embeddings_skipped"]`` and, when
+    the index is non-empty, raised to a warning. Silence here is what let the
+    index drift behind the graph unnoticed: the vectors simply stopped being
+    updated while every other build step reported success.
     """
     if provider is None and model is None:
-        provider, model = _infer_refresh_identity()
-        if provider is None and model is None:
+        provider, model, skip_reason = _resolve_refresh_identity(store)
+        if skip_reason is not None:
+            result["embeddings_skipped"] = skip_reason
+            # An empty index is the normal, intended case -- nothing has opted
+            # in to embedding, so there is nothing to fall behind.
+            if _stored_embedding_identities(store):
+                warning = f"Embedding refresh skipped: {skip_reason}"
+                logger.warning(warning)
+                warnings.append(warning)
             return
     if not provider or not model:
         warning = "Embedding refresh requires both an explicit provider and model."
@@ -101,9 +168,11 @@ def _run_embedding_refresh(
         from code_review_graph.embeddings import refresh_embeddings
 
         refreshed = refresh_embeddings(store, provider=provider, model=model)
-        if refreshed is not None:
-            result["embeddings_refreshed"] = refreshed["embedded"]
-            result["embeddings_purged"] = refreshed["purged"]
+        if refreshed is None:
+            result["embeddings_skipped"] = "index is empty"
+            return
+        result["embeddings_refreshed"] = refreshed["embedded"]
+        result["embeddings_purged"] = refreshed["purged"]
     except Exception as exc:
         logger.warning("Embedding refresh failed: %s", exc)
         warnings.append(

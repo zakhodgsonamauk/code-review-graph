@@ -465,6 +465,23 @@ def _embedding_refresh_kwargs(args, parser) -> _EmbeddingRefreshKwargs:
     }
 
 
+def _print_embedding_outcome(result: dict) -> None:
+    """Report what happened to the vector index.
+
+    Printed even when nothing happened, and with the reason. A build that
+    silently leaves the index untouched looks identical to one that refreshed
+    it, which is how a stale index goes unnoticed while every other step
+    reports success.
+    """
+    if "embeddings_refreshed" in result:
+        print(
+            f"Embeddings: {result.get('embeddings_refreshed', 0)} refreshed, "
+            f"{result.get('embeddings_purged', 0)} purged"
+        )
+    elif result.get("embeddings_skipped"):
+        print(f"Embeddings: skipped ({result['embeddings_skipped']})")
+
+
 def _non_negative_int(value: str) -> int:
     """Parse a non-negative integer for bounded CLI output."""
     try:
@@ -1686,6 +1703,7 @@ def main() -> None:
                     f"Full build: {parsed} files, {nodes} nodes, {edges} edges "
                     f"(postprocess={pp})"
                 )
+                _print_embedding_outcome(result)
                 if result.get("errors"):
                     print(f"Errors: {len(result['errors'])}")
 
@@ -1730,6 +1748,7 @@ def main() -> None:
                         f"{nodes} nodes, {edges} edges"
                         f" (postprocess={pp})"
                     )
+                _print_embedding_outcome(result)
 
             # --brief: append a one-line change-impact summary with the same
             # estimated context-savings approximation that detect-changes uses.

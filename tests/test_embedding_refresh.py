@@ -346,7 +346,7 @@ class TestRefreshWiring:
             )
             assert result["signatures_computed"] == 2
             assert any(
-                "Missing required environment" in warning
+                "Missing required setting" in warning
                 for warning in result["warnings"]
             )
         finally:

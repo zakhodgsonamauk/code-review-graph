@@ -1,7 +1,9 @@
 """Tests for the embeddings module."""
 
+import errno
 import json
 import os
+import sqlite3
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -10,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from code_review_graph.embeddings import (
+    _DEFAULT_EMBEDDED_KINDS,
     _RESOURCE_EXHAUSTION_ATTEMPTS,
     LOCAL_DEFAULT_MODEL,
     EmbeddingStore,
@@ -23,8 +26,12 @@ from code_review_graph.embeddings import (
     _embedding_error,
     _encode_vector,
     _is_localhost_url,
+    _is_transient_db_error,
     _node_to_text,
+    _with_db_retry,
+    embedded_node_kinds,
     get_provider,
+    load_embedding_config,
 )
 from code_review_graph.graph import GraphNode
 
@@ -256,7 +263,7 @@ class TestGetProviderValidation:
         """'  OPENAI ' must route to the openai branch (and fail on its
         missing env vars), not fall through to the local default."""
         with patch.dict(os.environ, {}, clear=True):
-            with pytest.raises(ValueError, match="Missing required environment"):
+            with pytest.raises(ValueError, match="Missing required setting"):
                 get_provider("  OPENAI ")
 
     def test_case_normalized_for_minimax(self):
@@ -1713,3 +1720,155 @@ class TestTransientErrorClassification:
                 provider.embed(["one input"])
 
         assert state["requests"] == _RESOURCE_EXHAUSTION_ATTEMPTS
+
+
+class TestEmbeddedNodeKinds:
+    """Test nodes are excluded by default, and the choice is overridable."""
+
+    def test_default_excludes_tests_and_files(self):
+        kinds = embedded_node_kinds()
+        assert "Function" in kinds and "Class" in kinds
+        assert "Test" not in kinds
+        assert "File" not in kinds
+
+    def test_env_override_can_restore_tests(self, monkeypatch):
+        monkeypatch.setenv("CRG_EMBED_KINDS", "Function,Test")
+        assert embedded_node_kinds() == frozenset({"Function", "Test"})
+
+    @pytest.mark.parametrize("value", ["", "   ", " , ,"])
+    def test_blank_override_falls_back_rather_than_embedding_nothing(
+        self, monkeypatch, value
+    ):
+        """An empty list would silently disable semantic search entirely."""
+        monkeypatch.setenv("CRG_EMBED_KINDS", value)
+        assert embedded_node_kinds() == _DEFAULT_EMBEDDED_KINDS
+
+
+class TestEmbeddingConfigFile:
+    """Settings resolve without ambient environment variables.
+
+    Git hooks inherit the committing shell and an MCP server keeps whatever
+    environment it started with, so both can miss variables exported later.
+    """
+
+    @staticmethod
+    def _write_config(tmp_path, body: str):
+        (tmp_path / "embeddings.toml").write_text(body, encoding="utf-8")
+
+    def test_config_file_supplies_openai_settings(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CRG_HOME", str(tmp_path))
+        self._write_config(
+            tmp_path,
+            'provider = "openai"\n'
+            'model = "qwen3-embedding"\n'
+            'base_url = "http://127.0.0.1:11434/v1"\n'
+            'api_key = "ollama"\n'
+            "dimension = 512\n",
+        )
+
+        provider = get_provider()
+
+        assert isinstance(provider, OpenAIEmbeddingProvider)
+        assert provider.name == "openai:qwen3-embedding@http://127.0.0.1:11434/v1"
+
+    def test_environment_takes_precedence_over_the_file(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CRG_HOME", str(tmp_path))
+        self._write_config(
+            tmp_path,
+            'provider = "openai"\nmodel = "from-file"\n'
+            'base_url = "http://127.0.0.1:11434/v1"\napi_key = "k"\n',
+        )
+        monkeypatch.setenv("CRG_OPENAI_MODEL", "from-env")
+
+        assert "from-env" in get_provider().name
+
+    def test_an_embeddings_table_heading_is_accepted(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CRG_HOME", str(tmp_path))
+        self._write_config(
+            tmp_path,
+            "[embeddings]\n"
+            'provider = "openai"\nmodel = "m"\n'
+            'base_url = "http://127.0.0.1:11434/v1"\napi_key = "k"\n',
+        )
+
+        assert isinstance(get_provider(), OpenAIEmbeddingProvider)
+
+    def test_malformed_file_is_ignored_not_fatal(self, tmp_path, monkeypatch):
+        """The file is a convenience; a broken one must not break callers who
+        are configured entirely through the environment."""
+        monkeypatch.setenv("CRG_HOME", str(tmp_path))
+        self._write_config(tmp_path, "this is not = valid toml [[[")
+
+        assert load_embedding_config() == {}
+
+    def test_missing_file_is_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CRG_HOME", str(tmp_path))
+        assert load_embedding_config() == {}
+
+    def test_error_names_the_config_path_as_an_option(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CRG_HOME", str(tmp_path))
+        with pytest.raises(ValueError, match="embeddings.toml"):
+            get_provider("openai")
+
+
+class TestTransientDatabaseErrors:
+    """Sync clients (Dropbox et al) lock the file mid-write; that is survivable."""
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            PermissionError(errno.EACCES, "Permission denied"),
+            OSError(errno.EPERM, "Operation not permitted"),
+            sqlite3.OperationalError("database is locked"),
+            sqlite3.OperationalError("unable to open database file"),
+            sqlite3.OperationalError("database table is locked: embeddings"),
+        ],
+    )
+    def test_lock_style_errors_are_transient(self, exc):
+        assert _is_transient_db_error(exc)
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            sqlite3.DatabaseError("file is not a database"),
+            sqlite3.IntegrityError("UNIQUE constraint failed"),
+            FileNotFoundError(errno.ENOENT, "No such file or directory"),
+            ValueError("nonsense"),
+        ],
+    )
+    def test_real_failures_are_not_retried(self, exc):
+        """A corrupt database must fail now, not after five sleeps."""
+        assert not _is_transient_db_error(exc)
+
+    def test_retry_succeeds_after_transient_locks(self):
+        attempts = {"n": 0}
+
+        def flaky():
+            attempts["n"] += 1
+            if attempts["n"] < 3:
+                raise PermissionError(errno.EACCES, "locked by sync client")
+            return "written"
+
+        with patch("code_review_graph.embeddings.time.sleep", lambda _s: None):
+            assert _with_db_retry(flaky, what="test write") == "written"
+        assert attempts["n"] == 3
+
+    def test_retry_gives_up_and_reraises_after_the_budget(self):
+        def always_locked():
+            raise PermissionError(errno.EACCES, "locked by sync client")
+
+        with patch("code_review_graph.embeddings.time.sleep", lambda _s: None):
+            with pytest.raises(PermissionError):
+                _with_db_retry(always_locked, what="test write")
+
+    def test_permanent_error_is_not_retried(self):
+        attempts = {"n": 0}
+
+        def corrupt():
+            attempts["n"] += 1
+            raise sqlite3.DatabaseError("file is not a database")
+
+        with patch("code_review_graph.embeddings.time.sleep", lambda _s: None):
+            with pytest.raises(sqlite3.DatabaseError):
+                _with_db_retry(corrupt, what="test write")
+        assert attempts["n"] == 1

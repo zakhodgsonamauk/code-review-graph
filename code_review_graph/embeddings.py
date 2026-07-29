@@ -10,6 +10,8 @@ Supports multiple providers:
 
 from __future__ import annotations
 
+import errno
+import functools
 import hashlib
 import logging
 import os
@@ -20,8 +22,9 @@ import sys
 import threading
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlparse
 
 from . import __version__ as _crg_version
@@ -84,6 +87,167 @@ _RESOURCE_EXHAUSTION_RE = re.compile(
     r"|connection reset by peer",
     re.IGNORECASE,
 )
+
+
+_T = TypeVar("_T")
+
+# The graph database often lives inside a synced folder (Dropbox, OneDrive,
+# iCloud). Those clients open files to upload them, which on Windows surfaces
+# as a short-lived EPERM/EACCES or a SQLite lock. A long embedding pass writes
+# repeatedly over many minutes, so it is very likely to collide with a sync at
+# some point -- and without a retry a single collision aborts the whole run.
+_DB_LOCK_RETRY_ATTEMPTS = 5
+_DB_LOCK_BACKOFF_SECONDS = 0.5
+_DB_LOCK_MESSAGE_RE = re.compile(
+    r"database is locked"
+    r"|database table is locked"
+    r"|unable to open database file"
+    r"|attempt to write a readonly database"
+    r"|disk i/o error",
+    re.IGNORECASE,
+)
+
+
+def _is_transient_db_error(exc: BaseException) -> bool:
+    """True for file-lock style failures a sync client causes transiently.
+
+    Deliberately narrow: a genuinely corrupt database or a missing parent
+    directory must fail immediately rather than after five sleeps.
+    """
+    if isinstance(exc, OSError):
+        return isinstance(exc, PermissionError) or exc.errno in (
+            errno.EACCES,
+            errno.EPERM,
+        )
+    if isinstance(exc, sqlite3.Error):
+        return bool(_DB_LOCK_MESSAGE_RE.search(str(exc)))
+    return False
+
+
+def _with_db_retry(operation: Callable[[], _T], *, what: str) -> _T:
+    """Run a database operation, retrying transient file-lock failures."""
+    for attempt in range(_DB_LOCK_RETRY_ATTEMPTS):
+        try:
+            return operation()
+        except Exception as exc:
+            if (
+                not _is_transient_db_error(exc)
+                or attempt == _DB_LOCK_RETRY_ATTEMPTS - 1
+            ):
+                raise
+            wait = _DB_LOCK_BACKOFF_SECONDS * (2 ** attempt)
+            logger.warning(
+                "%s blocked by a file lock (attempt %d/%d), retrying in %.1fs: %s",
+                what, attempt + 1, _DB_LOCK_RETRY_ATTEMPTS, wait, exc,
+            )
+            time.sleep(wait)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+#: Node kinds embedded by default.
+#:
+#: Tests are excluded. On a real Django/React graph they were 7,883 of 19,595
+#: vectors -- 40% of the index and 40% of every scan -- and crowded source out
+#: of results: a query about promoting uploads to permanent storage returned
+#: mostly integration tests. Coverage questions are answered better by the
+#: TESTED_BY edges the graph already stores (39,717 of them), which are exact
+#: rather than approximate. File nodes have never been embedded; their text is
+#: a path.
+DEFAULT_EMBEDDED_KINDS = frozenset({"Class", "Function", "Type"})
+_DEFAULT_EMBEDDED_KINDS = DEFAULT_EMBEDDED_KINDS  # backwards-compatible alias
+_EMBED_KINDS_ENV = "CRG_EMBED_KINDS"
+
+
+def embedded_node_kinds() -> frozenset[str]:
+    """Node kinds to embed.
+
+    Override with ``CRG_EMBED_KINDS`` as a comma-separated list, e.g.
+    ``Class,Function,Type,Test`` to restore test embedding. An empty or
+    all-whitespace value falls back to the default rather than embedding
+    nothing, which would silently disable semantic search.
+    """
+    raw = os.environ.get(_EMBED_KINDS_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_EMBEDDED_KINDS
+    kinds = frozenset(part.strip() for part in raw.split(",") if part.strip())
+    return kinds or _DEFAULT_EMBEDDED_KINDS
+
+
+#: Optional settings file under the per-user state directory. Exists because
+#: environment variables are not reliably present in every process that needs
+#: to embed: git hooks inherit the committing shell, and an MCP server started
+#: before the variables were exported keeps the stale environment for its whole
+#: life. Both then silently skip embedding refresh while the graph moves on.
+_EMBEDDING_CONFIG_FILENAME = "embeddings.toml"
+
+#: TOML key -> the environment variable that overrides it.
+_EMBEDDING_CONFIG_KEYS = (
+    "provider",
+    "model",
+    "base_url",
+    "api_key",
+    "dimension",
+    "batch_size",
+)
+
+
+def embedding_config_path() -> Path:
+    """Path to the optional embedding settings file."""
+    from .constants import crg_home
+
+    return crg_home() / _EMBEDDING_CONFIG_FILENAME
+
+
+def load_embedding_config() -> dict[str, str]:
+    """Load embedding settings from the per-user state directory.
+
+    Returns an empty mapping when the file is absent or unreadable -- the file
+    is an optional convenience, never a requirement, so a malformed one must
+    not break callers that are configured entirely through the environment. It
+    is logged at warning level rather than swallowed silently.
+
+    Values are stringified so callers can treat them exactly like environment
+    variables. This file may hold an API key, so it is read and never written
+    by this module: creating it, and choosing its permissions, stays with the
+    user.
+    """
+    path = embedding_config_path()
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return {}
+
+    try:
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:  # pragma: no cover - exercised on older interpreters only
+            import tomli as tomllib  # type: ignore[no-redef]
+    except ImportError:  # pragma: no cover - tomli is a declared dependency
+        logger.warning("Cannot read %s: no TOML parser available", path)
+        return {}
+
+    try:
+        parsed = tomllib.loads(raw.decode("utf-8", errors="replace"))
+    except tomllib.TOMLDecodeError as exc:
+        logger.warning("Ignoring malformed %s: %s", path, exc)
+        return {}
+
+    section = parsed.get("embeddings", parsed)
+    if not isinstance(section, dict):
+        return {}
+    return {
+        key: str(section[key]).strip()
+        for key in _EMBEDDING_CONFIG_KEYS
+        if section.get(key) is not None and str(section[key]).strip()
+    }
+
+
+def _setting(env_var: str, config: dict[str, str], config_key: str) -> str | None:
+    """Return a setting from the environment, else the config file."""
+    value = os.environ.get(env_var, "").strip()
+    if value:
+        return value
+    return config.get(config_key) or None
 
 
 class TransientEmbeddingError(RuntimeError):
@@ -783,21 +947,27 @@ def get_provider(
             "Valid: local, openai, google, minimax"
         )
 
-    # When no explicit provider is given but OpenAI-compatible env vars are
+    config = load_embedding_config()
+
+    # When no explicit provider is given but OpenAI-compatible settings are
     # configured, default to the openai provider so MCP tool calls that omit
     # the optional `provider` parameter still use the configured backend
-    # (#551).
-    if (
-        provider is None
-        and os.environ.get("CRG_OPENAI_API_KEY")
-        and os.environ.get("CRG_OPENAI_BASE_URL")
-    ):
-        name = "openai"
+    # (#551). The config file counts as configuration too, so a git hook or an
+    # MCP server started from a stale environment resolves the same backend.
+    if provider is None:
+        configured = config.get("provider", "").strip().lower()
+        if configured and configured in _VALID_PROVIDERS:
+            name = configured
+        elif (
+            _setting("CRG_OPENAI_API_KEY", config, "api_key")
+            and _setting("CRG_OPENAI_BASE_URL", config, "base_url")
+        ):
+            name = "openai"
 
     if name == "openai":
-        api_key = os.environ.get("CRG_OPENAI_API_KEY")
-        base_url = os.environ.get("CRG_OPENAI_BASE_URL")
-        resolved_model = model or os.environ.get("CRG_OPENAI_MODEL")
+        api_key = _setting("CRG_OPENAI_API_KEY", config, "api_key")
+        base_url = _setting("CRG_OPENAI_BASE_URL", config, "base_url")
+        resolved_model = model or _setting("CRG_OPENAI_MODEL", config, "model")
         if not api_key or not base_url or not resolved_model:
             missing = [
                 name for name, val in [
@@ -807,12 +977,13 @@ def get_provider(
                 ] if not val
             ]
             raise ValueError(
-                "Missing required environment variable(s) for the OpenAI "
-                f"embedding provider: {', '.join(missing)}."
+                "Missing required setting(s) for the OpenAI embedding "
+                f"provider: {', '.join(missing)}. Set them in the environment "
+                f"or in {embedding_config_path()}."
             )
-        dim_env = os.environ.get("CRG_OPENAI_DIMENSION")
+        dim_env = _setting("CRG_OPENAI_DIMENSION", config, "dimension")
         dimension = int(dim_env) if dim_env else None
-        batch_env = os.environ.get("CRG_OPENAI_BATCH_SIZE")
+        batch_env = _setting("CRG_OPENAI_BATCH_SIZE", config, "batch_size")
         batch_size = int(batch_env) if batch_env else None
         if not _is_localhost_url(base_url):
             _warn_cloud_egress("openai")
@@ -1005,9 +1176,12 @@ class EmbeddingStore:
         self.provider = get_provider(provider, model=model)
         self.available = self.provider is not None
         self.db_path = Path(db_path)
-        self._conn = sqlite3.connect(
-            str(self.db_path), timeout=30, check_same_thread=False,
-            isolation_level=None,
+        self._conn = _with_db_retry(
+            lambda: sqlite3.connect(
+                str(self.db_path), timeout=30, check_same_thread=False,
+                isolation_level=None,
+            ),
+            what=f"opening {self.db_path.name}",
         )
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_EMBEDDINGS_SCHEMA)
@@ -1041,8 +1215,9 @@ class EmbeddingStore:
         to_embed: list[tuple[GraphNode, str, str]] = []
         provider_name = self.provider.name
 
+        kinds = embedded_node_kinds()
         for node in nodes:
-            if node.kind == "File":
+            if node.kind not in kinds:
                 continue
             text = _node_to_text(node)
             text_hash = hashlib.sha256(text.encode()).hexdigest()
@@ -1074,17 +1249,33 @@ class EmbeddingStore:
         for start in range(0, len(to_embed), batch_size):
             batch = to_embed[start:start + batch_size]
             vectors = self.provider.embed([text for _, text, _ in batch])
-            for (node, _text, text_hash), vec in zip(batch, vectors):
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO embeddings "
-                    "(qualified_name, vector, text_hash, provider) "
-                    "VALUES (?, ?, ?, ?)",
-                    (node.qualified_name, _encode_vector(vec), text_hash, provider_name),
-                )
-            self._conn.commit()
+            # Retried as a unit: a sync client holding the file must not cost
+            # the GPU work already done for this batch.
+            _with_db_retry(
+                functools.partial(
+                    self._persist_batch, batch, vectors, provider_name
+                ),
+                what="writing embeddings",
+            )
             embedded += len(batch)
 
         return embedded
+
+    def _persist_batch(
+        self,
+        batch: list[tuple[GraphNode, str, str]],
+        vectors: list[list[float]],
+        provider_name: str,
+    ) -> None:
+        """Write one batch of vectors and commit it."""
+        for (node, _text, text_hash), vec in zip(batch, vectors):
+            self._conn.execute(
+                "INSERT OR REPLACE INTO embeddings "
+                "(qualified_name, vector, text_hash, provider) "
+                "VALUES (?, ?, ?, ?)",
+                (node.qualified_name, _encode_vector(vec), text_hash, provider_name),
+            )
+        self._conn.commit()
 
     def search(self, query: str, limit: int = 20) -> list[tuple[str, float]]:
         """Search for nodes by semantic similarity.
@@ -1196,7 +1387,13 @@ class EmbeddingStore:
         self._conn.commit()
 
     def purge_orphans(self) -> int:
-        """Delete vectors whose graph node no longer exists.
+        """Delete vectors that no longer belong in the index.
+
+        Two cases: the graph node is gone, or the node's kind is no longer
+        embedded. The second matters because narrowing ``CRG_EMBED_KINDS``
+        otherwise has no visible effect -- ``embed_nodes`` simply stops
+        refreshing those vectors while search keeps returning the stale ones,
+        so excluding a kind would appear not to work.
 
         Embeddings and graph nodes normally share a SQLite file.  Standalone
         embedding databases remain supported, so a missing ``nodes`` table is
@@ -1208,12 +1405,19 @@ class EmbeddingStore:
         ).fetchone()
         if has_nodes is None:
             return 0
+        kinds = sorted(embedded_node_kinds())
+        placeholders = ", ".join("?" for _ in kinds)
         cursor = self._conn.execute(
             "DELETE FROM embeddings "
             "WHERE NOT EXISTS ("
             "SELECT 1 FROM nodes "
             "WHERE nodes.qualified_name = embeddings.qualified_name"
+            ") OR EXISTS ("
+            "SELECT 1 FROM nodes "
+            "WHERE nodes.qualified_name = embeddings.qualified_name "
+            f"AND nodes.kind NOT IN ({placeholders})"
             ")",
+            kinds,
         )
         self._conn.commit()
         return max(cursor.rowcount, 0)
