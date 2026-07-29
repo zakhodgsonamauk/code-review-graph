@@ -10,14 +10,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from code_review_graph.embeddings import (
+    _RESOURCE_EXHAUSTION_ATTEMPTS,
     LOCAL_DEFAULT_MODEL,
     EmbeddingStore,
     GoogleEmbeddingProvider,
     LocalEmbeddingProvider,
     MiniMaxEmbeddingProvider,
     OpenAIEmbeddingProvider,
+    TransientEmbeddingError,
     _cosine_similarity,
     _decode_vector,
+    _embedding_error,
     _encode_vector,
     _is_localhost_url,
     _node_to_text,
@@ -1561,3 +1564,152 @@ class TestSearchBackendParity:
             assert [name for name, _ in numpy_results] == ["mine"]
         finally:
             store.close()
+
+
+# Verbatim body Ollama returned when the host ran out of ephemeral sockets
+# mid-pass on a 19,595-node graph.
+OLLAMA_SOCKET_EXHAUSTION_BODY = (
+    'Post "http://127.0.0.1:54310/tokenize": dial tcp 127.0.0.1:54310: bind: '
+    "An operation on a socket could not be performed because the system lacked "
+    "sufficient buffer space or because a queue was full."
+)
+
+
+@pytest.fixture
+def flaky_openai_server():
+    """Serve N client-error responses with a chosen body, then succeed."""
+    state = {"body": "", "status": 400, "failures": 0, "requests": 0}
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            size = int(self.headers["Content-Length"])
+            payload = json.loads(self.rfile.read(size))
+            state["requests"] += 1
+            if state["failures"] > 0:
+                state["failures"] -= 1
+                body = state["body"].encode()
+                self.send_response(state["status"])
+                self.send_header("Content-Type", "text/plain")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            data = [
+                {"index": i, "embedding": [1.0, 0.0, 0.0]}
+                for i in range(len(payload["input"]))
+            ]
+            body = json.dumps({"data": data}).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        host, port = server.server_address
+        yield f"http://{host}:{port}/v1", state
+    finally:
+        server.shutdown()
+
+
+class TestTransientErrorClassification:
+    """Host resource exhaustion arrives as HTTP 400 and must still be retried.
+
+    A local Ollama endpoint proxies to an internal runner and reports socket
+    exhaustion with a client-error status. Status code alone therefore cannot
+    decide retryability -- but retrying 4xx as a class would turn genuine bad
+    requests into slow failures, so only exhaustion signatures are retried.
+    """
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            OLLAMA_SOCKET_EXHAUSTION_BODY,
+            "listen tcp: bind: address already in use",
+            "dial tcp 127.0.0.1:9: connect: cannot assign requested address",
+            "socket: too many open files",
+            "read: connection reset by peer",
+            "accept: resource temporarily unavailable",
+            "no buffer space available",
+        ],
+    )
+    def test_exhaustion_messages_are_transient(self, message):
+        assert isinstance(_embedding_error(message), TransientEmbeddingError)
+
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "model 'nope' not found",
+            "invalid_request_error: input exceeds maximum batch size",
+            "Incorrect API key provided",
+            "unsupported dimensions value",
+        ],
+    )
+    def test_genuine_client_errors_stay_permanent(self, message):
+        error = _embedding_error(message)
+        assert isinstance(error, RuntimeError)
+        assert not isinstance(error, TransientEmbeddingError)
+
+    def test_transient_error_is_a_runtime_error_and_keeps_the_message(self):
+        """Callers catching RuntimeError must keep working, and the provider's
+        own text must survive so the failure stays diagnosable."""
+        error = _embedding_error(OLLAMA_SOCKET_EXHAUSTION_BODY)
+        assert isinstance(error, RuntimeError)
+        assert "queue was full" in str(error)
+
+    def test_exhaustion_400_is_retried_until_it_succeeds(self, flaky_openai_server):
+        base_url, state = flaky_openai_server
+        state["body"] = OLLAMA_SOCKET_EXHAUSTION_BODY
+        state["status"] = 400
+        state["failures"] = 2
+        provider = OpenAIEmbeddingProvider(
+            api_key="k", base_url=base_url, model="m", dimension=3,
+        )
+
+        slept: list[float] = []
+        with patch("code_review_graph.embeddings.time.sleep", slept.append):
+            vectors = provider.embed(["one input"])
+
+        assert vectors == [[1.0, 0.0, 0.0]]
+        assert state["requests"] == 3
+        # Long schedule, not the 1s/2s exponential: the OS reclaims slowly.
+        assert slept == [30, 60]
+
+    def test_genuine_400_fails_on_the_first_attempt(self, flaky_openai_server):
+        base_url, state = flaky_openai_server
+        state["body"] = "model 'nope' not found"
+        state["status"] = 400
+        state["failures"] = 1
+        provider = OpenAIEmbeddingProvider(
+            api_key="k", base_url=base_url, model="nope", dimension=3,
+        )
+
+        slept: list[float] = []
+        with patch("code_review_graph.embeddings.time.sleep", slept.append):
+            with pytest.raises(RuntimeError, match="not found") as caught:
+                provider.embed(["one input"])
+
+        assert not isinstance(caught.value, TransientEmbeddingError)
+        assert state["requests"] == 1, "a real 400 must not be retried"
+        assert slept == []
+
+    def test_exhaustion_gives_up_after_its_attempt_budget(self, flaky_openai_server):
+        base_url, state = flaky_openai_server
+        state["body"] = OLLAMA_SOCKET_EXHAUSTION_BODY
+        state["status"] = 400
+        state["failures"] = 99
+        provider = OpenAIEmbeddingProvider(
+            api_key="k", base_url=base_url, model="m", dimension=3,
+        )
+
+        with patch("code_review_graph.embeddings.time.sleep", lambda _s: None):
+            with pytest.raises(TransientEmbeddingError):
+                provider.embed(["one input"])
+
+        assert state["requests"] == _RESOURCE_EXHAUSTION_ATTEMPTS

@@ -52,6 +52,54 @@ _USER_AGENT = (
     "(+https://github.com/tirth8205/code-review-graph)"
 )
 
+# Retry budgets. Ordinary transient failures (429, 5xx, dropped sockets) clear
+# quickly; host resource exhaustion needs long enough for the OS to reclaim
+# what ran out, which is far slower than an exponential-from-1s schedule.
+_RETRY_ATTEMPTS = 3
+_RETRY_BACKOFF_BASE_SECONDS = 2
+_RESOURCE_EXHAUSTION_ATTEMPTS = 5
+_RESOURCE_EXHAUSTION_BACKOFF_SECONDS = 30
+_MAX_RETRY_ATTEMPTS = max(_RETRY_ATTEMPTS, _RESOURCE_EXHAUSTION_ATTEMPTS)
+
+# Some endpoints report a *server-side* transient shortage using a client-error
+# status, which makes status code alone the wrong signal. Ollama proxies to an
+# internal runner and returns HTTP 400 whose body is a Go dial error when the
+# host runs out of ephemeral sockets:
+#
+#   OpenAI API HTTP 400: Post "http://127.0.0.1:54310/tokenize": dial tcp ...
+#   bind: An operation on a socket could not be performed because the system
+#   lacked sufficient buffer space or because a queue was full.
+#
+# Retrying 4xx as a class would turn genuine bad requests (invalid model, batch
+# too large) into slow failures, so match exhaustion signatures explicitly.
+_RESOURCE_EXHAUSTION_RE = re.compile(
+    r"queue was full"
+    r"|buffer space"
+    r"|\bbind:"
+    r"|dial tcp"
+    r"|address already in use"
+    r"|cannot assign requested address"
+    r"|resource temporarily unavailable"
+    r"|too many open files"
+    r"|connection reset by peer",
+    re.IGNORECASE,
+)
+
+
+class TransientEmbeddingError(RuntimeError):
+    """A provider error whose cause is expected to clear on its own.
+
+    Carries the provider's original message so it stays as actionable as a
+    permanent failure, while letting the retry loop wait rather than abort.
+    """
+
+
+def _embedding_error(message: str) -> RuntimeError:
+    """Return a transient or permanent error for a provider message."""
+    if _RESOURCE_EXHAUSTION_RE.search(message):
+        return TransientEmbeddingError(message)
+    return RuntimeError(message)
+
 # ---------------------------------------------------------------------------
 # Provider Interface and Implementations
 # ---------------------------------------------------------------------------
@@ -481,8 +529,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             },
         )
 
-        max_retries = 3
-        for attempt in range(max_retries):
+        for attempt in range(_MAX_RETRY_ATTEMPTS):
             try:
                 _ssl_ctx = ssl.create_default_context()
                 try:
@@ -517,7 +564,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                         # Non-JSON error body is fine: we already seeded
                         # err_msg with the raw body above, so fall through.
                         pass
-                    raise RuntimeError(
+                    raise _embedding_error(
                         f"OpenAI API HTTP {http_err.code}: {err_msg}"
                     ) from http_err
 
@@ -526,7 +573,8 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                 if "error" in response:
                     err = response["error"]
                     msg = err.get("message", "unknown") if isinstance(err, dict) else str(err)
-                    raise RuntimeError(f"OpenAI API error: {msg}")
+                    # A 200 body can carry the same exhaustion text as a 4xx.
+                    raise _embedding_error(f"OpenAI API error: {msg}")
 
                 data = response.get("data", [])
                 if not data:
@@ -583,7 +631,13 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                 # misaligned data length — those are caller-side bugs that
                 # will keep failing on retry.
                 is_retryable = False
-                if isinstance(e, urllib.error.HTTPError):
+                # Host resource exhaustion reported behind a client-error
+                # status. Needs a longer pause and more attempts than an
+                # ordinary hiccup, because the OS reclaims slowly.
+                exhausted = isinstance(e, TransientEmbeddingError)
+                if exhausted:
+                    is_retryable = True
+                elif isinstance(e, urllib.error.HTTPError):
                     is_retryable = e.code == 429 or 500 <= e.code < 600
                 elif isinstance(e, (
                     urllib.error.URLError,
@@ -600,12 +654,19 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
                     http.client.RemoteDisconnected,
                 )):
                     is_retryable = True
-                if not is_retryable or attempt == max_retries - 1:
+                budget = (
+                    _RESOURCE_EXHAUSTION_ATTEMPTS if exhausted else _RETRY_ATTEMPTS
+                )
+                if not is_retryable or attempt >= budget - 1:
                     raise
-                wait = 2 ** attempt
+                wait = (
+                    _RESOURCE_EXHAUSTION_BACKOFF_SECONDS * (attempt + 1)
+                    if exhausted
+                    else _RETRY_BACKOFF_BASE_SECONDS ** attempt
+                )
                 logger.warning(
                     "OpenAI embeddings API error (attempt %d/%d), retrying in %ds: %s",
-                    attempt + 1, max_retries, wait, e,
+                    attempt + 1, budget, wait, e,
                 )
                 time.sleep(wait)
 
@@ -1015,8 +1076,9 @@ class EmbeddingStore:
             vectors = self.provider.embed([text for _, text, _ in batch])
             for (node, _text, text_hash), vec in zip(batch, vectors):
                 self._conn.execute(
-                    """INSERT OR REPLACE INTO embeddings (qualified_name, vector, text_hash, provider)
-                       VALUES (?, ?, ?, ?)""",
+                    "INSERT OR REPLACE INTO embeddings "
+                    "(qualified_name, vector, text_hash, provider) "
+                    "VALUES (?, ?, ?, ?)",
                     (node.qualified_name, _encode_vector(vec), text_hash, provider_name),
                 )
             self._conn.commit()
