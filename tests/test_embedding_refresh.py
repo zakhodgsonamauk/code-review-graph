@@ -2,6 +2,7 @@
 
 import asyncio
 import sys
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -715,5 +716,94 @@ class TestIncrementalEmbeddingPersistence:
                 assert len(healthy.embedded) == 2
             finally:
                 store.close()
+        finally:
+            graph.close()
+
+
+class TestUnchangedRepositoryStillReconcilesTheIndex:
+    """A quiet repository must not be able to hide a stale index.
+
+    `update` returned early when no file changed, skipping refresh entirely. But
+    embedded text changes without any file changing -- upgrading the package
+    alters _node_to_text, and CRG_EMBED_KINDS alters which nodes belong in the
+    index at all. On a repository nobody is editing, nothing would ever
+    reconcile it, and the output said nothing either way.
+    """
+
+    def test_refresh_runs_when_no_files_changed(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("CRG_OPENAI_API_KEY", "ollama")
+        monkeypatch.setenv("CRG_OPENAI_BASE_URL", "http://127.0.0.1:11434/v1")
+        monkeypatch.setenv("CRG_OPENAI_MODEL", "test-model")
+        graph, _ = _graph_with_function(tmp_path)
+        try:
+            with (
+                patch(
+                    "code_review_graph.tools.build._get_store",
+                    return_value=(graph, Path(tmp_path)),
+                ),
+                patch(
+                    "code_review_graph.incremental.resolve_incremental_base",
+                    return_value="HEAD~1",
+                ),
+                patch(
+                    "code_review_graph.tools.build.incremental_update",
+                    return_value={
+                        "files_updated": 0,
+                        "total_nodes": 2,
+                        "total_edges": 1,
+                        "changed_files": [],
+                        "dependent_files": [],
+                    },
+                ),
+                patch(
+                    "code_review_graph.embeddings.refresh_embeddings",
+                    return_value={"embedded": 0, "purged": 7},
+                ) as refresh,
+            ):
+                from code_review_graph.tools.build import build_or_update_graph
+
+                result = build_or_update_graph(
+                    full_rebuild=False, repo_root=str(tmp_path),
+                )
+
+            refresh.assert_called_once()
+            # Purged vectors are surfaced, not swallowed: this is exactly the
+            # CRG_EMBED_KINDS case, where nothing is added but stale kinds go.
+            assert result["embeddings_purged"] == 7
+            assert result["files_updated"] == 0
+        finally:
+            graph.close()
+
+    def test_skip_reason_is_reported_when_no_files_changed(self, tmp_path):
+        """Silence here is what the reporting exists to remove."""
+        graph, _ = _graph_with_function(tmp_path)
+        try:
+            with (
+                patch(
+                    "code_review_graph.tools.build._get_store",
+                    return_value=(graph, Path(tmp_path)),
+                ),
+                patch(
+                    "code_review_graph.incremental.resolve_incremental_base",
+                    return_value="HEAD~1",
+                ),
+                patch(
+                    "code_review_graph.tools.build.incremental_update",
+                    return_value={
+                        "files_updated": 0,
+                        "total_nodes": 2,
+                        "total_edges": 1,
+                        "changed_files": [],
+                        "dependent_files": [],
+                    },
+                ),
+            ):
+                from code_review_graph.tools.build import build_or_update_graph
+
+                result = build_or_update_graph(
+                    full_rebuild=False, repo_root=str(tmp_path),
+                )
+
+            assert "embeddings_skipped" in result
         finally:
             graph.close()

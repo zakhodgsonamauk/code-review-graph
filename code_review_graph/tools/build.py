@@ -664,7 +664,7 @@ def build_or_update_graph(
         else:
             result = incremental_update(root, store, base=base_resolved)
             if result["files_updated"] == 0:
-                return {
+                unchanged: dict[str, Any] = {
                     **result,
                     "status": "ok",
                     "build_type": "incremental",
@@ -672,6 +672,28 @@ def build_or_update_graph(
                     "summary": "No changes detected. Graph is up to date.",
                     "postprocess_level": postprocess,
                 }
+                # The graph is unchanged, but the vector index still can be
+                # stale: embedded text changes when the package is upgraded, and
+                # which kinds are embedded changes with CRG_EMBED_KINDS. Neither
+                # touches a file, so skipping refresh here left the only path
+                # where staleness persists indefinitely -- no file will change
+                # on a quiet repository, so nothing would ever reconcile it.
+                # Refresh is a text-hash comparison per node when there is
+                # nothing to do, so it costs little on this path.
+                unchanged_warnings: list[str] = []
+                _run_embedding_refresh(
+                    store,
+                    unchanged,
+                    unchanged_warnings,
+                    provider=embedding_provider,
+                    model=embedding_model,
+                )
+                if unchanged_warnings:
+                    unchanged["warnings"] = [
+                        *unchanged.get("warnings", []),
+                        *unchanged_warnings,
+                    ]
+                return unchanged
             build_result = {
                 **result,
                 "status": "ok",
