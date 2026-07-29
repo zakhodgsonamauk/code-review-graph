@@ -1000,20 +1000,29 @@ class EmbeddingStore:
         if not to_embed:
             return 0
 
-        # Encode in batches
-        texts = [t for _, t, _ in to_embed]
-        vectors = self.provider.embed(texts)
+        # Encode and persist in batches, committing each one before requesting
+        # the next. Embedding a large graph is a long remote conversation that
+        # can fail part-way through -- a provider timeout, a rate limit, or (on
+        # Windows) ephemeral-port exhaustion from a local endpoint opening a
+        # socket per input. Persisting only at the end discarded every vector
+        # computed before the failure; a 19k-node graph lost minutes of GPU
+        # work and made no progress across retries. Committing per batch means
+        # a failure costs one batch, and re-running resumes from where it
+        # stopped via the text_hash gate above.
+        embedded = 0
+        for start in range(0, len(to_embed), batch_size):
+            batch = to_embed[start:start + batch_size]
+            vectors = self.provider.embed([text for _, text, _ in batch])
+            for (node, _text, text_hash), vec in zip(batch, vectors):
+                self._conn.execute(
+                    """INSERT OR REPLACE INTO embeddings (qualified_name, vector, text_hash, provider)
+                       VALUES (?, ?, ?, ?)""",
+                    (node.qualified_name, _encode_vector(vec), text_hash, provider_name),
+                )
+            self._conn.commit()
+            embedded += len(batch)
 
-        for (node, _text, text_hash), vec in zip(to_embed, vectors):
-            blob = _encode_vector(vec)
-            self._conn.execute(
-                """INSERT OR REPLACE INTO embeddings (qualified_name, vector, text_hash, provider)
-                   VALUES (?, ?, ?, ?)""",
-                (node.qualified_name, blob, text_hash, provider_name),
-            )
-
-        self._conn.commit()
-        return len(to_embed)
+        return embedded
 
     def search(self, query: str, limit: int = 20) -> list[tuple[str, float]]:
         """Search for nodes by semantic similarity.

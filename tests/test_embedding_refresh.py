@@ -592,3 +592,128 @@ class TestInferredRefreshIdentity:
             assert "embeddings_refreshed" not in result
         finally:
             graph.close()
+
+
+class _FailingAfterNBatchesProvider:
+    """Embeds normally for N batches, then raises like a dropped connection."""
+
+    name = "local:test-model"
+    dimension = 2
+
+    def __init__(self, batches_before_failure: int) -> None:
+        self._remaining = batches_before_failure
+        self.calls = 0
+
+    def embed(self, texts):
+        self.calls += 1
+        if self._remaining <= 0:
+            raise RuntimeError("OpenAI API HTTP 400: dial tcp: queue was full")
+        self._remaining -= 1
+        return [[float(len(text)), 1.0] for text in texts]
+
+    def embed_query(self, text):
+        return [1.0, 0.0]
+
+
+def _graph_with_functions(tmp_path, count):
+    db = tmp_path / "graph.db"
+    store = GraphStore(db)
+    file_path = str(tmp_path / "module.py")
+    store.upsert_node(
+        NodeInfo(
+            kind="File",
+            name=file_path,
+            file_path=file_path,
+            line_start=1,
+            line_end=count * 2,
+            language="python",
+        )
+    )
+    for index in range(count):
+        store.upsert_node(
+            NodeInfo(
+                kind="Function",
+                name=f"func_{index}",
+                file_path=file_path,
+                line_start=index * 2 + 1,
+                line_end=index * 2 + 2,
+                language="python",
+            )
+        )
+    store.commit()
+    return store, file_path
+
+
+class TestIncrementalEmbeddingPersistence:
+    """Vectors are committed per batch, so a mid-run failure keeps progress.
+
+    Persisting only after every vector returned meant one dropped connection
+    discarded the whole pass. On a 19k-node graph that lost minutes of GPU work
+    and left the index empty, so retries restarted from nothing.
+    """
+
+    def test_batches_are_committed_before_the_next_request(self, tmp_path):
+        graph, _ = _graph_with_functions(tmp_path, 10)
+        provider = _StubProvider()
+        try:
+            with patch(
+                "code_review_graph.embeddings.get_provider", return_value=provider
+            ):
+                store = EmbeddingStore(graph.db_path)
+            try:
+                embedded = store.embed_nodes(graph.get_all_nodes(), batch_size=4)
+                assert embedded == 10
+                assert store.count() == 10
+            finally:
+                store.close()
+        finally:
+            graph.close()
+
+    def test_failure_part_way_through_keeps_completed_batches(self, tmp_path):
+        graph, _ = _graph_with_functions(tmp_path, 10)
+        provider = _FailingAfterNBatchesProvider(batches_before_failure=2)
+        try:
+            with patch(
+                "code_review_graph.embeddings.get_provider", return_value=provider
+            ):
+                store = EmbeddingStore(graph.db_path)
+            try:
+                with pytest.raises(RuntimeError, match="queue was full"):
+                    store.embed_nodes(graph.get_all_nodes(), batch_size=4)
+
+                # Two batches of four were committed before the third failed.
+                assert store.count() == 8
+            finally:
+                store.close()
+        finally:
+            graph.close()
+
+    def test_rerun_resumes_only_the_missing_nodes(self, tmp_path):
+        graph, _ = _graph_with_functions(tmp_path, 10)
+        failing = _FailingAfterNBatchesProvider(batches_before_failure=2)
+        try:
+            with patch(
+                "code_review_graph.embeddings.get_provider", return_value=failing
+            ):
+                store = EmbeddingStore(graph.db_path)
+            try:
+                with pytest.raises(RuntimeError):
+                    store.embed_nodes(graph.get_all_nodes(), batch_size=4)
+            finally:
+                store.close()
+
+            healthy = _StubProvider()
+            with patch(
+                "code_review_graph.embeddings.get_provider", return_value=healthy
+            ):
+                store = EmbeddingStore(graph.db_path)
+            try:
+                embedded = store.embed_nodes(graph.get_all_nodes(), batch_size=4)
+                # Only the two nodes left unembedded are re-requested.
+                assert embedded == 2
+                assert store.count() == 10
+                assert len(healthy.embedded) == 2
+            finally:
+                store.close()
+        finally:
+            graph.close()
