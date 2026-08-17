@@ -822,6 +822,33 @@ def generate_skills(repo_root: Path, skills_dir: Path | None = None) -> Path:
     return skills_dir
 
 
+# The body of the SessionStart hook, shared by every platform generator so the three
+# cannot drift.
+#
+# POSIX sh, because Claude Code, Codex and CodeBuddy all run hook commands through a
+# shell on every platform.
+#
+# `if`/`else` rather than `cmd || { ...; exit 0; }`: an `exit` partway through a hook
+# command terminates the shell before a large stdin payload has been written, which
+# resurfaces the BrokenPipeError of bug #493 (on Windows, as OSError errno 22). The
+# stdin drain at the front only helps if nothing exits before the writer is done.
+#
+# `daemon add` is idempotent and instant. `daemon start` is spawned DETACHED and
+# unwaited, because it does not return promptly and waiting on it would reintroduce the
+# blocking behaviour this whole change removes. `daemon restart` is never used: on
+# Windows it kills the daemon and then dies in its own liveness check, leaving nothing
+# running (fixed separately in daemon_cli, but still the wrong tool here).
+_DAEMON_ENSURE_SNIPPET = (
+    'CRG_REPO="$(git rev-parse --show-toplevel 2>/dev/null)"; '
+    'if [ -n "$CRG_REPO" ]; then '
+    'code-review-graph daemon add "$CRG_REPO" >/dev/null 2>&1 || true; '
+    "code-review-graph daemon status 2>/dev/null | grep -qi 'daemon: *running' || "
+    "{ code-review-graph daemon start >/dev/null 2>&1 & }; "
+    'code-review-graph status --repo "$CRG_REPO" || true; '
+    "else echo 'Not a git repo, skipping'; fi"
+)
+
+
 def generate_hooks_config(repo_root: Path) -> dict[str, Any]:
     """Generate Claude Code hooks configuration.
 
@@ -835,43 +862,55 @@ def generate_hooks_config(repo_root: Path) -> dict[str, Any]:
     is shareable across collaborators with different checkout paths.
     A PATH guard ensures the hook exits silently when the binary is not on
     ``$PATH`` (e.g. installed in a project venv).
+
+    THERE IS DELIBERATELY NO ``PostToolUse`` HOOK. Read this before adding one back.
+
+    This function used to emit ``update --skip-flows`` on ``Edit|Write`` with a 30 s
+    timeout. Measured on a 2,679-file repo with an embedding index, that command takes
+    **90-200 seconds even when the graph is fully current and nothing has changed** —
+    ``--skip-flows`` still runs a full import-resolution pass and reconciles embeddings.
+    So it was killed on every single edit, and the trailing ``|| true`` swallowed the
+    failure, leaving a permanently broken graph that looked healthy.
+
+    The damage is per EDIT, which is what makes it severe rather than merely wasteful.
+    Measured across three subagent workflows in one session: 152 Edit/Write calls at a
+    mean of 29.9 s — 57% of all tool wait, against 6.5 s mean for Bash *including every
+    test run*. An agent touching twenty files pays the timeout twenty times.
+
+    On a 1,129-file repo the same command is 6.2 s, which is why this went unnoticed:
+    it completes on small repos and silently strangles on large ones, and the boundary
+    moves as a repo grows.
+
+    Backgrounding it instead (``... &``) is not the fix either: twenty edits would spawn
+    twenty concurrent full rebuilds of the same graph.
+
+    Freshness belongs to the WATCH DAEMON, which is what ``SessionStart`` now ensures.
+    It polls every 2 s in the background, blocks nothing, and its watch list lives in
+    ``~/.code-review-graph/`` so it is per-user rather than per-project.
     """
+    # POSIX sh: Claude Code runs hook commands through a shell on every platform.
+    # `daemon add` is idempotent and instant; `daemon start` is spawned DETACHED and
+    # unwaited, because it does not return promptly and waiting on it would reintroduce
+    # exactly the blocking behaviour this replaced. `daemon restart` is deliberately
+    # never used — see the note in daemon_cli._handle_stop.
+    session_start_command = (
+        "cat >/dev/null || true; "
+        "command -v code-review-graph >/dev/null 2>&1 || exit 0; "
+        + _DAEMON_ENSURE_SNIPPET
+    )
     return {
         "hooks": {
-            "PostToolUse": [
-                {
-                    "matcher": "Edit|Write",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": (
-                                "cat >/dev/null || true; "
-                                "command -v code-review-graph >/dev/null 2>&1 || exit 0; "
-                                "git rev-parse --git-dir >/dev/null 2>&1"
-                                " && code-review-graph update --skip-flows"
-                                " --repo \"$(git rev-parse --show-toplevel 2>/dev/null)\""
-                                " || true"
-                            ),
-                            "timeout": 30,
-                        },
-                    ],
-                },
-            ],
             "SessionStart": [
                 {
                     "matcher": "",
                     "hooks": [
                         {
                             "type": "command",
-                            "command": (
-                                "cat >/dev/null || true; "
-                                "command -v code-review-graph >/dev/null 2>&1 || exit 0; "
-                                "git rev-parse --git-dir >/dev/null 2>&1"
-                                " && code-review-graph status"
-                                " --repo \"$(git rev-parse --show-toplevel 2>/dev/null)\""
-                                " || echo 'Not a git repo, skipping'"
-                            ),
-                            "timeout": 10,
+                            "command": session_start_command,
+                            # Three fast calls plus a detached spawn. Measured at well
+                            # under 1 s with the daemon already up; the ceiling exists
+                            # only so a wedged `git` cannot hang a session start.
+                            "timeout": 15,
                         },
                     ],
                 },
@@ -881,27 +920,15 @@ def generate_hooks_config(repo_root: Path) -> dict[str, Any]:
 
 
 def generate_codex_hooks_config(repo_root: Path) -> dict[str, Any]:
-    """Generate native Codex hooks configuration for ~/.codex/hooks.json."""
+    """Generate native Codex hooks configuration for ~/.codex/hooks.json.
+
+    No ``PostToolUse`` entry, for the reasons documented at length on
+    ``generate_hooks_config``. This generator's version was the worst of them: its
+    matcher was ``Write|Edit|Bash``, so a 30-second-capped graph rebuild fired after
+    every shell command as well as every edit.
+    """
     return {
         "hooks": {
-            "PostToolUse": [
-                {
-                    "matcher": "Write|Edit|Bash",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": (
-                                "cat >/dev/null || true; "
-                                "git rev-parse --git-dir >/dev/null 2>&1"
-                                " && code-review-graph update --skip-flows"
-                                " || true"
-                            ),
-                            "timeout": 30,
-                            "statusMessage": "Updating code-review-graph",
-                        },
-                    ],
-                },
-            ],
             "SessionStart": [
                 {
                     "matcher": "startup|resume",
@@ -909,12 +936,9 @@ def generate_codex_hooks_config(repo_root: Path) -> dict[str, Any]:
                         {
                             "type": "command",
                             "command": (
-                                "cat >/dev/null || true; "
-                                "git rev-parse --git-dir >/dev/null 2>&1"
-                                " && code-review-graph status"
-                                " || echo 'Not a git repo, skipping'"
+                                "cat >/dev/null || true; " + _DAEMON_ENSURE_SNIPPET
                             ),
-                            "timeout": 10,
+                            "timeout": 15,
                             "statusMessage": "Checking code-review-graph status",
                         },
                     ],
@@ -922,6 +946,18 @@ def generate_codex_hooks_config(repo_root: Path) -> dict[str, Any]:
             ],
         }
     }
+
+
+# The hook commands this package used to install, kept ONLY so `uninstall` and any
+# re-install can still recognise and remove them from a settings file written by an
+# earlier version. Never emitted again — see generate_hooks_config for why.
+#
+# Matched by substring rather than equality: the exact string varied across versions
+# (with and without the `--repo` argument, with and without the PATH guard) and every
+# variant needs removing.
+LEGACY_POST_TOOL_USE_MARKERS: tuple[str, ...] = (
+    "code-review-graph update --skip-flows",
+)
 
 
 def install_git_hook(repo_root: Path) -> Path | None:
@@ -994,6 +1030,72 @@ fi
     return hook_path
 
 
+def _prune_legacy_update_hooks(
+    existing_hooks: dict[str, Any],
+    settings_path: Path,
+) -> dict[str, Any]:
+    """Strip the blocking ``update`` hook earlier versions of this installer wrote.
+
+    Merging alone is not enough for an UPGRADE. Every project installed by a previous
+    version already has ``code-review-graph update --skip-flows`` on ``PostToolUse``
+    in its settings, and a merge that only adds entries would leave it there for good —
+    so `install` would keep the very defect this change exists to remove.
+
+    Matched by substring, because the exact command differed across versions (with and
+    without ``--repo``, with and without the ``command -v`` PATH guard) and every
+    variant has to go. Only entries this package wrote are touched: a user's own hook
+    would have to contain that exact command string to match, in which case it is the
+    same defect and removing it is still right.
+
+    An event left with no entries BY THIS PRUNE is dropped, rather than left as
+    ``"PostToolUse": []``. An event the user already had empty is preserved untouched —
+    those are two different things, and conflating them deletes configuration this
+    function was never asked to touch.
+    """
+    pruned: dict[str, Any] = {}
+    removed = 0
+    for hook_name, entries in existing_hooks.items():
+        if not isinstance(entries, list):
+            pruned[hook_name] = entries
+            continue
+        kept_entries = []
+        removed_here = 0
+        for entry in entries:
+            if not isinstance(entry, dict):
+                kept_entries.append(entry)
+                continue
+            inner = entry.get("hooks")
+            if not isinstance(inner, list):
+                kept_entries.append(entry)
+                continue
+            kept_inner = [
+                hook
+                for hook in inner
+                if not (
+                    isinstance(hook, dict)
+                    and any(
+                        marker in str(hook.get("command", ""))
+                        for marker in LEGACY_POST_TOOL_USE_MARKERS
+                    )
+                )
+            ]
+            removed_here += len(inner) - len(kept_inner)
+            if kept_inner:
+                kept_entries.append({**entry, "hooks": kept_inner})
+        removed += removed_here
+        # Keep the event unless this prune is what emptied it.
+        if kept_entries or not removed_here:
+            pruned[hook_name] = kept_entries
+    if removed:
+        logger.info(
+            "Removed %d blocking `update` hook(s) from %s — freshness is the watch "
+            "daemon's job now (code-review-graph daemon status)",
+            removed,
+            settings_path,
+        )
+    return pruned
+
+
 def _merge_hooks_into_settings(
     settings_dir: Path,
     hooks_config: dict[str, Any],
@@ -1016,6 +1118,8 @@ def _merge_hooks_into_settings(
     if not isinstance(existing_hooks, dict):
         logger.warning("Existing hooks config is not a dict; replacing with defaults")
         existing_hooks = {}
+
+    existing_hooks = _prune_legacy_update_hooks(existing_hooks, settings_path)
 
     merged_hooks = dict(existing_hooks)
     for hook_name, hook_entries in hooks_config.get("hooks", {}).items():
@@ -1063,14 +1167,15 @@ def install_codebuddy_hooks(repo_root: Path) -> Path:
     resolves the checkout at hook runtime instead of embedding the installer's
     absolute path, so committed settings work for every collaborator.
     """
-    hooks_config = generate_hooks_config(repo_root)
-    # CodeBuddy's Bash tool can create or rewrite files without going through
-    # Edit/Write, so its PostToolUse contract also observes Bash. The command
-    # itself still resolves the repository dynamically at hook runtime.
-    hooks_config["hooks"]["PostToolUse"][0]["matcher"] = "Edit|Write|Bash"
+    # No matcher widening any more. CodeBuddy's Bash tool can create or rewrite files
+    # without going through Edit/Write, which is why this used to add `Bash` to the
+    # PostToolUse matcher — but there is no PostToolUse hook to widen now, and adding
+    # `Bash` was the worst version of that hook in any case: it fired a graph rebuild
+    # after every shell command, tests included. The watch daemon sees a write however
+    # it was made, so widening a matcher is exactly the problem it removes.
     return _merge_hooks_into_settings(
         repo_root / ".codebuddy",
-        hooks_config,
+        generate_hooks_config(repo_root),
     )
 
 

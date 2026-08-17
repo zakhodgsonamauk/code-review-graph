@@ -1,12 +1,32 @@
 {
+  "//": [
+    "THERE IS DELIBERATELY NO `update` HOOK ON Write|Edit ANY MORE.",
+    "",
+    "This file used to carry `code-review-graph update --skip-flows` on a Write|Edit|Bash",
+    "matcher with a 30 s timeout. Measured on a 2,679-file repo with an embedding index, that",
+    "command takes 90-200 SECONDS even when the graph is fully current and nothing changed —",
+    "`--skip-flows` still runs a full import-resolution pass and reconciles embeddings. Behind a",
+    "30 s timeout it was killed on every edit AND every shell command, and nothing reported it.",
+    "",
+    "Cost measured in one agent session on that repo: 152 Edit/Write calls at a mean of 29.9 s,",
+    "57% of all tool wait. Bash averaged 6.5 s INCLUDING every test run. On a 1,129-file repo the",
+    "same command is 6.2 s, which is why this went unnoticed for so long: it completes on small",
+    "repos and strangles on large ones, and the boundary moves as a repo grows.",
+    "",
+    "Freshness is the watch daemon's job. SessionStart below registers the repo and starts the",
+    "daemon if it is down; the daemon then polls in the background and blocks nothing. Its watch",
+    "list lives in ~/.code-review-graph/, so it is per-user rather than per-project.",
+    "",
+    "See generate_hooks_config() in code_review_graph/skills.py for the full account."
+  ],
   "SessionStart": [
     {
       "matcher": "",
       "hooks": [
         {
           "type": "command",
-          "command": "cat >/dev/null || true; code-review-graph status",
-          "timeout": 10
+          "command": "cat >/dev/null || true; command -v code-review-graph >/dev/null 2>&1 || exit 0; CRG_REPO=\"$(git rev-parse --show-toplevel 2>/dev/null)\"; if [ -n \"$CRG_REPO\" ]; then code-review-graph daemon add \"$CRG_REPO\" >/dev/null 2>&1 || true; code-review-graph daemon status 2>/dev/null | grep -qi 'daemon: *running' || { code-review-graph daemon start >/dev/null 2>&1 & }; code-review-graph status --repo \"$CRG_REPO\" || true; else echo 'Not a git repo, skipping'; fi",
+          "timeout": 15
         }
       ]
     }
@@ -18,16 +38,6 @@
         {
           "type": "command",
           "command": "cat >/dev/null || true; code-review-graph build >/dev/null 2>&1 &"
-        }
-      ]
-    },
-    {
-      "matcher": "Write|Edit|Bash",
-      "hooks": [
-        {
-          "type": "command",
-          "command": "cat >/dev/null || true; code-review-graph update --skip-flows",
-          "timeout": 30
         }
       ]
     }

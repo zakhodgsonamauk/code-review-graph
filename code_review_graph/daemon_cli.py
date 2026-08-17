@@ -56,8 +56,26 @@ def _handle_start(args: argparse.Namespace) -> None:
 
 
 def _handle_stop(_args: argparse.Namespace) -> None:
-    """Stop the running daemon process."""
-    from .daemon import clear_pid, is_daemon_running, read_pid
+    """Stop the running daemon process.
+
+    WINDOWS: every liveness check here goes through ``daemon.pid_alive`` rather than
+    ``os.kill(pid, 0)``, and there is no ``SIGKILL`` escalation.
+
+    Both were live bugs. ``os.kill(pid, 0)`` on Windows routes to
+    GenerateConsoleCtrlEvent and raises ``OSError`` (WinError 87) for an ALIVE pid
+    outside the caller's console process group — the same issue ``pid_alive`` was
+    written for (#511) — and ``OSError`` is not ``ProcessLookupError``, so it escaped
+    the wait loop's handler and crashed the command. ``signal.SIGKILL`` does not exist
+    on Windows at all, so the escalation path was an ``AttributeError`` waiting to
+    happen.
+
+    The observable symptom was that ``stop`` terminated the daemon (``os.kill`` with
+    SIGTERM maps to TerminateProcess, so that part worked) and THEN crashed with a
+    traceback, leaving the pid file behind. ``restart``, which calls stop first, killed
+    the daemon and never started the replacement — so a user asking for a restart was
+    left with nothing running and a stack trace.
+    """
+    from .daemon import clear_pid, is_daemon_running, pid_alive, read_pid
 
     if not is_daemon_running():
         print("Daemon is not running.")
@@ -78,20 +96,31 @@ def _handle_stop(_args: argparse.Namespace) -> None:
     except PermissionError:
         print(f"Error: Permission denied sending signal to PID {pid}.")
         sys.exit(1)
+    except OSError as exc:
+        # Windows raises OSError for cases POSIX reports as ProcessLookupError, and
+        # SIGTERM there is TerminateProcess, which may well have succeeded. Fall
+        # through to the wait loop and let pid_alive decide rather than failing here.
+        logger.debug("Signalling PID %d raised %s; verifying liveness instead", pid, exc)
 
-    # Wait up to 5 seconds for process to die
+    # Wait up to 5 seconds for the process to die.
     for _ in range(50):
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
+        if not pid_alive(pid):
             break
         time.sleep(0.1)
     else:
-        # Still alive after 5s — send SIGKILL
+        if sys.platform == "win32":
+            # No SIGKILL on Windows. SIGTERM already meant TerminateProcess, which is
+            # not refusable, so a still-alive pid here is not something a second signal
+            # will fix — report it instead of crashing on a missing attribute.
+            print(
+                f"Daemon (PID {pid}) did not exit within 5s. Terminate it manually: "
+                f"taskkill /PID {pid} /F"
+            )
+            sys.exit(1)
         print("Daemon did not stop gracefully, sending SIGKILL...")
         try:
             os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
+        except (ProcessLookupError, OSError):
             pass
 
     clear_pid()

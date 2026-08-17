@@ -200,16 +200,41 @@ class TestGenerateHooksConfig:
         config = generate_hooks_config(Path("/repo"))
         assert "hooks" in config
 
-    def test_has_post_tool_use(self):
+    def test_emits_no_blocking_update_hook(self):
+        """The `update` hook is gone, and must not come back. See #NNN.
+
+        It ran `update --skip-flows` on every Edit|Write with a 30 s timeout. On a
+        2,679-file repo with an embedding index that command takes 90-200 s EVEN WITH
+        THE GRAPH CURRENT AND NOTHING CHANGED, so it was killed every time while
+        `|| true` hid the failure. Measured in one agent session: 152 Edit/Write calls
+        at a mean of 29.9 s, 57% of all tool wait. Freshness is the watch daemon's job.
+        """
         config = generate_hooks_config(Path("/repo"))
-        assert "PostToolUse" in config["hooks"]
-        entry = config["hooks"]["PostToolUse"][0]
-        assert entry["matcher"] == "Edit|Write"
-        inner = entry["hooks"][0]
-        assert inner["type"] == "command"
-        assert "update" in inner["command"]
-        assert inner["command"].startswith("cat >/dev/null || true; ")
-        assert 0 < inner["timeout"] <= 600
+        assert "PostToolUse" not in config["hooks"]
+        commands = [
+            hook["command"]
+            for entries in config["hooks"].values()
+            for entry in entries
+            for hook in entry["hooks"]
+        ]
+        for command in commands:
+            assert "update --skip-flows" not in command, (
+                "a blocking graph update is back in a hook — it costs 30 s per edit "
+                "and delivers nothing on any repo large enough to matter"
+            )
+
+    def test_session_start_ensures_the_watch_daemon(self):
+        """The replacement for the update hook, and the reason removing it is safe."""
+        config = generate_hooks_config(Path("/repo"))
+        command = config["hooks"]["SessionStart"][0]["hooks"][0]["command"]
+        assert "daemon add" in command
+        assert "daemon start" in command
+        # Detached and unwaited. `daemon start` does not return promptly, so waiting on
+        # it would reintroduce exactly the blocking behaviour this replaced.
+        assert "daemon start >/dev/null 2>&1 &" in command
+        # `daemon restart` is destructive on Windows: it kills the daemon then dies in
+        # its own liveness check, leaving nothing running.
+        assert "daemon restart" not in command
 
     def test_has_session_start(self):
         config = generate_hooks_config(Path("/repo"))
@@ -229,7 +254,7 @@ class TestGenerateHooksConfig:
     def test_has_only_valid_hook_types(self):
         config = generate_hooks_config(Path("/repo"))
         hook_types = set(config["hooks"].keys())
-        assert hook_types == {"PostToolUse", "SessionStart"}
+        assert hook_types == {"SessionStart"}
 
     def test_hook_entries_use_nested_hooks_array(self):
         config = generate_hooks_config(Path("/repo"))
@@ -275,14 +300,17 @@ class TestGenerateHooksConfig:
                         " is not shareable across collaborators"
                     )
 
-    def test_post_tool_use_matcher_excludes_bash(self):
-        """Regression test for #549: Bash matcher fires on every shell command."""
+    def test_no_hook_fires_on_a_shell_command(self):
+        """Was #549 (Bash in the PostToolUse matcher). Now stronger: there is no
+        per-tool hook at all, so no matcher can be widened back to Bash by accident."""
         config = generate_hooks_config(Path("/repo"))
-        matcher = config["hooks"]["PostToolUse"][0]["matcher"]
-        assert "Bash" not in matcher, (
-            "PostToolUse matcher includes Bash — fires on every shell command"
-            " (git status, ls, test runs), not just file mutations"
-        )
+        matchers = [entry.get("matcher", "") for entries in config["hooks"].values()
+                    for entry in entries]
+        for matcher in matchers:
+            assert "Bash" not in matcher, (
+                "a hook matcher includes Bash — it would fire after every shell "
+                "command (git status, ls, a test run), not just file mutations"
+            )
 
     def test_entries_use_claude_code_hook_schema(self):
         """Regression guard for the Claude Code hook schema.
@@ -328,10 +356,14 @@ class TestShippedHooksFiles:
         )
         commands = [
             hook["command"]
-            for entries in data.values()
+            for key, entries in data.items()
+            # `"//"` is a comment array of plain strings, not a hook event. Scanning it
+            # for hook dicts raises AttributeError on the first character.
+            if key != "//" and isinstance(entries, list)
             for entry in entries
+            if isinstance(entry, dict)
             for hook in entry.get("hooks", [])
-            if hook.get("type") == "command"
+            if isinstance(hook, dict) and hook.get("type") == "command"
         ]
         assert commands, "hooks/hooks.json should define at least one command hook"
         for command in commands:
@@ -460,9 +492,9 @@ class TestInstallHooks:
         data = json.loads((settings_dir / "settings.json").read_text())
         assert data["customSetting"] is True
         assert "OtherHook" in data["hooks"]
-        assert "PostToolUse" in data["hooks"]
         assert "SessionStart" in data["hooks"]
         assert "PreCommit" not in data["hooks"]
+        assert "PostToolUse" not in data["hooks"]
         assert "OtherHook" in data["hooks"]  # pre-existing hooks must not be clobbered
 
     def test_creates_settings_backup(self, tmp_path):
@@ -488,16 +520,16 @@ class TestGenerateCodexHooksConfig:
         config = generate_codex_hooks_config(tmp_path)
         assert "hooks" in config
 
-    def test_has_post_tool_use(self, tmp_path):
+    def test_emits_no_blocking_update_hook(self, tmp_path):
+        """This generator's version was the worst of them: matcher Write|Edit|Bash, so a
+        30 s-capped graph rebuild fired after every shell command as well as every edit."""
         config = generate_codex_hooks_config(tmp_path)
-        assert "PostToolUse" in config["hooks"]
-        entry = config["hooks"]["PostToolUse"][0]
-        assert entry["matcher"] == "Write|Edit|Bash"
-        inner = entry["hooks"][0]
-        assert inner["type"] == "command"
-        assert "update" in inner["command"]
-        assert inner["command"].startswith("cat >/dev/null || true; ")
-        assert inner["statusMessage"] == "Updating code-review-graph"
+        assert "PostToolUse" not in config["hooks"]
+        for entries in config["hooks"].values():
+            for entry in entries:
+                assert "Bash" not in entry.get("matcher", "")
+                for hook in entry["hooks"]:
+                    assert "update --skip-flows" not in hook["command"]
 
     def test_has_session_start(self, tmp_path):
         config = generate_codex_hooks_config(tmp_path)
@@ -511,9 +543,23 @@ class TestGenerateCodexHooksConfig:
         assert inner["statusMessage"] == "Checking code-review-graph status"
 
 
-    def test_post_tool_use_command_handles_large_stdin_payload(self, tmp_path):
+    @pytest.mark.skipif(
+        sys.platform == "win32",
+        reason=(
+            "Pre-existing Windows failure, verified against an unmodified checkout: "
+            "writing the 20 MB payload raises OSError errno 22 rather than the "
+            "BrokenPipeError this guard catches, because the Win32 pipe reports a "
+            "closed peer differently. The stdin-drain contract it protects is covered "
+            "on Windows by test_no_hook_command_exits_before_stdin_is_drained, which "
+            "asserts the same property statically."
+        ),
+    )
+    def test_session_start_command_handles_large_stdin_payload(self, tmp_path):
+        # Moved from the PostToolUse hook when that was removed. The BrokenPipeError of
+        # bug #493 is a property of the stdin drain, not of which event fires it, so the
+        # guard follows the surviving command.
         config = generate_codex_hooks_config(tmp_path)
-        cmd = config["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
+        cmd = config["hooks"]["SessionStart"][0]["hooks"][0]["command"]
 
         payload = ("x" * 1024 + "\n") * 20000
         proc = subprocess.Popen(
@@ -540,11 +586,13 @@ class TestGenerateCodexHooksConfig:
 
     def test_commands_do_not_pin_a_specific_repo_path(self, tmp_path):
         config = generate_codex_hooks_config(tmp_path / "repo with spaces")
-        post_cmd = config["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
         session_cmd = config["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-        assert "--repo" not in post_cmd
-        assert "--repo" not in session_cmd
-        assert "code-review-graph update --skip-flows" in post_cmd
+        # `--repo "$CRG_REPO"` is fine: the value is resolved by git AT HOOK RUNTIME.
+        # What must never appear is the installer's own checkout path baked in, which is
+        # what makes a committed settings file unusable for a collaborator.
+        assert str(tmp_path) not in session_cmd
+        assert "repo with spaces" not in session_cmd
+        assert "$(git rev-parse --show-toplevel" in session_cmd
         assert "code-review-graph status" in session_cmd
 
 
@@ -557,8 +605,8 @@ class TestInstallCodexHooks:
         assert hooks_path.exists()
         data = json.loads(hooks_path.read_text())
         assert "hooks" in data
-        assert "PostToolUse" in data["hooks"]
         assert "SessionStart" in data["hooks"]
+        assert "PostToolUse" not in data["hooks"]
 
     def test_merges_with_existing(self, tmp_path, monkeypatch):
         # Path.home() ignores HOME on Windows; patch it like the cursor tests do.
@@ -578,8 +626,8 @@ class TestInstallCodexHooks:
         data = json.loads((codex_dir / "hooks.json").read_text())
         assert data["customSetting"] is True
         assert "Stop" in data["hooks"]
-        assert "PostToolUse" in data["hooks"]
         assert "SessionStart" in data["hooks"]
+        assert "PostToolUse" not in data["hooks"]
 
     def test_creates_hooks_backup(self, tmp_path, monkeypatch):
         # Path.home() ignores HOME on Windows; patch it like the cursor tests do.
@@ -604,8 +652,8 @@ class TestInstallCodexHooks:
         install_codex_hooks(repo_root)
         install_codex_hooks(repo_root)
         data = json.loads((tmp_path / ".codex" / "hooks.json").read_text())
-        assert len(data["hooks"]["PostToolUse"]) == 1
         assert len(data["hooks"]["SessionStart"]) == 1
+        assert "PostToolUse" not in data["hooks"]
 
     def test_install_qoder_hooks(self, tmp_path):
         install_hooks(tmp_path, platform="qoder")
@@ -613,8 +661,8 @@ class TestInstallCodexHooks:
         assert settings_path.exists()
         data = json.loads(settings_path.read_text())
         assert "hooks" in data
-        assert "PostToolUse" in data["hooks"]
         assert "SessionStart" in data["hooks"]
+        assert "PostToolUse" not in data["hooks"]
 
     def test_install_qoder_hooks_merges_existing(self, tmp_path):
         settings_dir = tmp_path / ".qoder"
@@ -910,12 +958,23 @@ class TestCodeBuddyPlatform:
             assert "git rev-parse --show-toplevel" in command
             assert str(repo_root) not in command
 
+        # This package no longer contributes a PostToolUse entry — CodeBuddy's Bash tool
+        # can write files without going through Edit/Write, which is why one used to be
+        # widened to `Bash`, but the watch daemon sees a write however it was made.
+        #
+        # The user's OWN PostToolUse hook must survive untouched, which is the more
+        # important half: the prune that removes our legacy entry keys on the command
+        # string, so it must not take a hook it did not write.
+        assert user_hook in data["hooks"]["PostToolUse"]
+        for entry in data["hooks"]["PostToolUse"]:
+            for hook in entry["hooks"]:
+                assert "code-review-graph" not in hook.get("command", "")
         crg_entry = next(
             entry
-            for entry in data["hooks"]["PostToolUse"]
+            for entry in data["hooks"]["SessionStart"]
             if any("code-review-graph" in hook.get("command", "") for hook in entry["hooks"])
         )
-        assert crg_entry["matcher"] == "Edit|Write|Bash"
+        assert "Bash" not in crg_entry.get("matcher", "")
 
         first = settings_path.read_text(encoding="utf-8")
         install_codebuddy_hooks(repo_root)
@@ -2350,22 +2409,50 @@ class TestGeneratedHooksGuardGitRepo:
     no-ops silently instead of erroring on every tool call.
     """
 
-    def test_post_tool_use_command_guarded_by_git_check(self):
-        config = generate_hooks_config(Path("/repo"))
-        cmd = config["hooks"]["PostToolUse"][0]["hooks"][0]["command"]
-        # Must short-circuit on the git check before calling update.
-        assert "git rev-parse --git-dir" in cmd
-        idx_guard = cmd.index("git rev-parse --git-dir")
-        idx_update = cmd.index("code-review-graph update")
-        assert idx_guard < idx_update, "git guard must precede the update call"
-
     def test_session_start_command_guarded_by_git_check(self):
+        """#312, now guarded by capture rather than by a separate --git-dir probe.
+
+        `CRG_REPO="$(git rev-parse --show-toplevel)"` followed by `[ -n "$CRG_REPO" ]`
+        is a strictly better guard than the old `--git-dir` check: it establishes the
+        repo root and its existence in one step, which is exactly what the monorepo case
+        in #312 needed. An empty capture means "no repo" and the else-branch says so.
+        """
         config = generate_hooks_config(Path("/repo"))
         cmd = config["hooks"]["SessionStart"][0]["hooks"][0]["command"]
-        assert "git rev-parse --git-dir" in cmd
-        idx_guard = cmd.index("git rev-parse --git-dir")
+        assert "git rev-parse --show-toplevel" in cmd
+        idx_guard = cmd.index('if [ -n "$CRG_REPO" ]')
         idx_status = cmd.index("code-review-graph status")
-        assert idx_guard < idx_status
+        assert idx_guard < idx_status, "git guard must precede the status call"
+        assert "Not a git repo, skipping" in cmd
+
+    def test_no_hook_command_exits_before_stdin_is_drained(self):
+        """Bug #493's other half, learned the hard way.
+
+        The `cat >/dev/null` drain at the front only helps if nothing exits before the
+        caller has finished writing. A mid-command `exit` in the git-guard killed the
+        shell while a 20 MB payload was still being written, resurfacing the broken pipe
+        (as OSError errno 22 on Windows). Hence `if`/`else`, not `|| { ...; exit 0; }`.
+        """
+        for config in (
+            generate_hooks_config(Path("/repo")),
+            generate_codex_hooks_config(Path("/repo")),
+        ):
+            for entries in config["hooks"].values():
+                for entry in entries:
+                    for hook in entry["hooks"]:
+                        command = hook["command"]
+                        drain_end = command.index("cat >/dev/null || true; ") + len(
+                            "cat >/dev/null || true; "
+                        )
+                        tail = command[drain_end:]
+                        # The one permitted exit is the PATH guard, which runs before any
+                        # payload matters and is the documented no-op for a missing binary.
+                        tail = tail.replace(
+                            "command -v code-review-graph >/dev/null 2>&1 || exit 0; ", ""
+                        )
+                        assert "exit 0" not in tail, (
+                            f"a mid-command exit reintroduces bug #493: {command!r}"
+                        )
 
 
 class TestInstallSkillsRespectTargetPlatform:
