@@ -1306,6 +1306,68 @@ class TestWatchReconciliation:
         finally:
             store.close()
 
+    @staticmethod
+    def _init_git_repo(root):
+        subprocess.run(["git", "init", "-q"], cwd=root, check=True)
+
+    def test_watch_skips_gitignored_files(self, tmp_path):
+        self._init_git_repo(tmp_path)
+        (tmp_path / ".gitignore").write_text(".worktrees/\n")
+        copy = tmp_path / ".worktrees" / "copy"
+        copy.mkdir(parents=True)
+        ignored = copy / "leaked.py"
+        ignored.write_text("def leaked():\n    pass\n")
+        kept = tmp_path / "kept.py"
+        kept.write_text("def kept():\n    pass\n")
+        store = GraphStore(tmp_path / "graph.db")
+        handler = _create_watch_handler(tmp_path, store, None)
+        try:
+            from watchdog.events import FileModifiedEvent
+
+            handler.process([FileModifiedEvent(str(ignored)), FileModifiedEvent(str(kept))])
+
+            assert store.get_nodes_by_file(str(ignored)) == []
+            assert store.get_nodes_by_file(str(kept))
+        finally:
+            store.close()
+
+    def test_watch_directory_create_skips_gitignored_tree(self, tmp_path):
+        self._init_git_repo(tmp_path)
+        (tmp_path / ".gitignore").write_text(".worktrees/\n")
+        copy = tmp_path / ".worktrees" / "copy"
+        copy.mkdir(parents=True)
+        source = copy / "inside.py"
+        source.write_text("def inside():\n    pass\n")
+        store = GraphStore(tmp_path / "graph.db")
+        handler = _create_watch_handler(tmp_path, store, None)
+        try:
+            from watchdog.events import DirCreatedEvent
+
+            handler.process([DirCreatedEvent(str(copy))])
+
+            assert store.get_nodes_by_file(str(source)) == []
+        finally:
+            store.close()
+
+    def test_watch_skips_nested_working_copy(self, tmp_path):
+        self._init_git_repo(tmp_path)
+        nested = tmp_path / "linked-copy"
+        nested.mkdir()
+        (nested / ".git").write_text("gitdir: ../.git/worktrees/linked-copy\n")
+        source = nested / "nested.py"
+        source.write_text("def nested():\n    pass\n")
+        store = GraphStore(tmp_path / "graph.db")
+        handler = _create_watch_handler(tmp_path, store, None)
+        try:
+            from watchdog.events import DirCreatedEvent, FileModifiedEvent
+
+            handler.process([FileModifiedEvent(str(source))])
+            handler.process([DirCreatedEvent(str(nested))])
+
+            assert store.get_nodes_by_file(str(source)) == []
+        finally:
+            store.close()
+
     def test_watch_directory_create_indexes_parseable_descendants(self, tmp_path):
         store = GraphStore(tmp_path / "graph.db")
         handler = _create_watch_handler(tmp_path, store, None)

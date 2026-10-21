@@ -492,6 +492,63 @@ def _should_ignore(path: str, patterns: list[str]) -> bool:
     return False
 
 
+def _git_ignored_paths(repo_root: Path, rel_paths: list[str]) -> set[str]:
+    """Return the subset of *rel_paths* that git's ignore rules exclude.
+
+    A full build indexes ``git ls-files`` output, so gitignored files never
+    enter the graph that way. The watcher sees raw filesystem events instead,
+    so without this check it indexes gitignored trees (for example a
+    ``.worktrees/`` folder full of temporary project copies) and the graph
+    grows without bound. Tracked files are never reported as ignored.
+
+    Returns an empty set when *repo_root* is not a git work tree or git is
+    unavailable, leaving the tool's own ignore patterns as the only filter.
+    """
+    if not rel_paths or detect_vcs(repo_root) != "git":
+        return set()
+    payload = "\0".join(path.replace("\\", "/") for path in rel_paths) + "\0"
+    try:
+        result = subprocess.run(
+            ["git", "check-ignore", "--stdin", "-z"],
+            input=payload,
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            cwd=str(repo_root),
+            timeout=_GIT_TIMEOUT,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning("git check-ignore failed in %s: %s", repo_root, exc)
+        return set()
+    # Exit 0: some paths ignored. Exit 1: none ignored. Anything else: error.
+    if result.returncode not in (0, 1):
+        logger.warning(
+            "git check-ignore exited %s in %s: %s",
+            result.returncode, repo_root, result.stderr.strip(),
+        )
+        return set()
+    ignored = {entry for entry in result.stdout.split("\0") if entry}
+    return {path for path in rel_paths if path.replace("\\", "/") in ignored}
+
+
+def _inside_nested_repo(repo_root: Path, rel_path: str, include_self: bool = False) -> bool:
+    """True when *rel_path* lies inside another git or svn working copy.
+
+    Linked worktrees, clones and submodule checkouts below the repository
+    root carry their own ``.git`` entry. Their files belong to that copy, not
+    to this repository, and ``git ls-files`` never lists them. With
+    *include_self*, *rel_path* itself counts when it is such a root
+    (used for directory events).
+    """
+    parts = Path(rel_path).parts
+    limit = len(parts) if include_self else len(parts) - 1
+    current = repo_root
+    for part in parts[:limit]:
+        current = current / part
+        if (current / ".git").exists() or (current / ".svn").exists():
+            return True
+    return False
+
+
 def _is_binary(path: Path) -> bool:
     """Quick heuristic: check if file appears to be binary."""
     try:
@@ -1445,6 +1502,10 @@ def _create_watch_handler(
             directory = repo_root / relative_directory
             if not directory.is_dir() or directory.is_symlink():
                 return set()
+            if _inside_nested_repo(repo_root, relative_directory, include_self=True):
+                return set()
+            if _git_ignored_paths(repo_root, [relative_directory]):
+                return set()
             return {
                 str(path.relative_to(repo_root))
                 for path in directory.rglob("*")
@@ -1479,9 +1540,13 @@ def _create_watch_handler(
 
         def process(self, events: list[FileSystemEvent]) -> None:
             try:
-                changed_files = sorted(
-                    {path for event in events for path in self._event_paths(event)}
-                )
+                candidates = {path for event in events for path in self._event_paths(event)}
+                candidates = {
+                    path for path in candidates
+                    if not _inside_nested_repo(repo_root, path)
+                }
+                candidates -= _git_ignored_paths(repo_root, sorted(candidates))
+                changed_files = sorted(candidates)
                 if not changed_files:
                     return
                 result = incremental_update(
